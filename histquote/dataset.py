@@ -13,14 +13,16 @@ import hashlib
 import json
 import os
 import sqlite3
+import uuid
 from pathlib import Path
 
 from .calendar import TradingCalendar
+from .adjudication import Adjudication
 from .identity import Security, Split
-from .query import QuoteView
+from .query import QuoteView, SourceCandidate
 from .quote import Quote, QuoteEvent, QuoteStatus
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _parse_dt(value: str | _dt.datetime) -> _dt.datetime:
@@ -58,12 +60,33 @@ CREATE TABLE IF NOT EXISTS quote_event(
     reason TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL,
     source_record TEXT NOT NULL,
+    target_source TEXT NOT NULL DEFAULT '',
+    target_record TEXT NOT NULL DEFAULT '',
     content_hash TEXT NOT NULL,
     UNIQUE(security_id, business_date, source, source_record)
 );
 CREATE INDEX IF NOT EXISTS idx_event_asof
     ON quote_event(security_id, business_date, received_at, seq);
+CREATE TABLE IF NOT EXISTS adjudication(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    security_id TEXT NOT NULL,
+    business_date TEXT NOT NULL,
+    chosen_source TEXT NOT NULL,
+    chosen_record TEXT NOT NULL,
+    decision_received_at TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    decision_id TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_adjudication_asof
+    ON adjudication(security_id, business_date, decision_received_at, seq);
 """
+
+_EXTRA_COLUMNS = {
+    "quote_event": {
+        "target_source": "TEXT NOT NULL DEFAULT ''",
+        "target_record": "TEXT NOT NULL DEFAULT ''",
+    },
+}
 
 
 class Dataset:
@@ -74,8 +97,26 @@ class Dataset:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_DDL)
+        self._migrate()
         self._init_meta(name)
         self.calendar = TradingCalendar(self.conn)
+        # 默认跨来源优先级（序号越小越优先）；修订由同来源事件链单独处理。
+        self.source_priority: dict[str, int] = {}
+
+    def _migrate(self) -> None:
+        """为旧库补齐新增列，保证首轮快照可直接重开。"""
+        for table, columns in _EXTRA_COLUMNS.items():
+            existing = {
+                r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")
+            }
+            for column, decl in columns.items():
+                if column not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        self.conn.commit()
+
+    def set_source_priority(self, priority: dict[str, int]) -> None:
+        """设置来源优先级；未列出的来源排在其后并按来源名字典序决胜。"""
+        self.source_priority = dict(priority)
 
     # ---------- 基础信息 ----------
 
@@ -148,8 +189,9 @@ class Dataset:
         o, hi, lo, c, v = _quote_to_tuple(event.quote)
         cur = self.conn.execute(
             "INSERT INTO quote_event(security_id, business_date, received_at, kind,"
-            " open, high, low, close, volume, reason, source, source_record, content_hash)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " open, high, low, close, volume, reason, source, source_record,"
+            " target_source, target_record, content_hash)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 event.security_id,
                 event.business_date.isoformat(),
@@ -159,7 +201,38 @@ class Dataset:
                 event.reason,
                 event.source,
                 event.source_record,
+                event.target_source,
+                event.target_record,
                 h,
+            ),
+        )
+        self.conn.commit()
+        return True, cur.lastrowid
+
+    def add_adjudication(self, decision: Adjudication) -> tuple[bool, int | None]:
+        """追加一条冲突裁决。裁决只引用来源记录，绝不修改来源原记录。
+
+        同一 decision_id 重放视为幂等。裁决在其 decision_received_at 之前不可见。
+        """
+        if decision.decision_id:
+            existing = self.conn.execute(
+                "SELECT seq FROM adjudication WHERE decision_id=?",
+                (decision.decision_id,),
+            ).fetchone()
+            if existing is not None:
+                return False, existing["seq"]
+        cur = self.conn.execute(
+            "INSERT INTO adjudication(security_id, business_date, chosen_source,"
+            " chosen_record, decision_received_at, reason, decision_id)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (
+                decision.security_id,
+                decision.business_date.isoformat(),
+                decision.chosen_source,
+                decision.chosen_record,
+                decision.decision_received_at.isoformat(),
+                decision.reason,
+                decision.decision_id or f"_auto_{uuid.uuid4().hex}",
             ),
         )
         self.conn.commit()
@@ -179,6 +252,7 @@ class Dataset:
                 "kind": event.kind,
                 "quote": dataclasses_as_dict(event.quote),
                 "reason": event.reason,
+                "target": [event.target_source, event.target_record],
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -187,15 +261,111 @@ class Dataset:
 
     # ---------- 双时态查询 ----------
 
-    def _visible_event(
+    def _visible_events(
+        self, security_id: str, business_date: str, known_at: _dt.datetime
+    ) -> list[sqlite3.Row]:
+        return list(self.conn.execute(
+            "SELECT * FROM quote_event"
+            " WHERE security_id=? AND business_date=? AND received_at <= ?"
+            " ORDER BY received_at, seq",
+            (security_id, business_date, known_at.isoformat()),
+        ))
+
+    def _visible_adjudication(
         self, security_id: str, business_date: str, known_at: _dt.datetime
     ) -> sqlite3.Row | None:
         return self.conn.execute(
-            "SELECT * FROM quote_event"
-            " WHERE security_id=? AND business_date=? AND received_at <= ?"
-            " ORDER BY received_at DESC, seq DESC LIMIT 1",
+            "SELECT * FROM adjudication"
+            " WHERE security_id=? AND business_date=? AND decision_received_at <= ?"
+            " ORDER BY decision_received_at DESC, seq DESC LIMIT 1",
             (security_id, business_date, known_at.isoformat()),
         ).fetchone()
+
+    @staticmethod
+    def _row_key(row: sqlite3.Row) -> tuple[str, str]:
+        return row["source"], row["source_record"]
+
+    def _resolve(
+        self, security_id: str, bd: _dt.date, known_at: _dt.datetime
+    ) -> dict:
+        """合并截至 known_at 可见的全部事件，输出候选与裁决结果。
+
+        - 每条来源原始/修订记录都保留为候选，并标注是否已被其来源撤回；
+        - revision 是对事实的更正：最新一条未撤回的修订优先于 raw；
+        - 多条 raw 冲突时，优先采用可见裁决指向的记录，否则按来源优先级；
+        - suspension / cancel 对全天生效，时间晚于被选行情记录时覆盖行情状态。
+        """
+        bd_s = bd.isoformat()
+        rows = self._visible_events(security_id, bd_s, known_at)
+
+        withdrawn_by: dict[tuple[str, str], str] = {}
+        status_events: list[sqlite3.Row] = []
+        quote_rows: list[sqlite3.Row] = []
+        for row in rows:
+            kind = row["kind"]
+            if kind == "withdrawal":
+                withdrawn_by[(row["target_source"], row["target_record"])] = (
+                    row["source_record"]
+                )
+            elif kind in ("suspension", "cancel"):
+                status_events.append(row)
+            else:
+                quote_rows.append(row)
+
+        candidates = tuple(
+            SourceCandidate(
+                source=r["source"],
+                source_record=r["source_record"],
+                kind=r["kind"],
+                received_at=_parse_dt(r["received_at"]),
+                close=r["close"],
+                active=self._row_key(r) not in withdrawn_by,
+                withdrawn_by=withdrawn_by.get(self._row_key(r), ""),
+            )
+            for r in quote_rows
+        )
+        active_rows = [
+            r for r in quote_rows if self._row_key(r) not in withdrawn_by
+        ]
+
+        decision = self._visible_adjudication(security_id, bd_s, known_at)
+        chosen: sqlite3.Row | None = None
+        basis = "none"
+        chosen_decision: sqlite3.Row | None = None
+
+        if decision is not None:
+            target = (decision["chosen_source"], decision["chosen_record"])
+            matched = next(
+                (r for r in active_rows if self._row_key(r) == target), None
+            )
+            if matched is not None:
+                chosen, chosen_decision, basis = matched, decision, "adjudicated"
+
+        if chosen is None:
+            active_revisions = [r for r in active_rows if r["kind"] == "revision"]
+            active_raws = [r for r in active_rows if r["kind"] == "raw"]
+            if active_revisions:
+                chosen = max(active_revisions, key=lambda r: (r["received_at"], r["seq"]))
+                basis = "revision"
+            elif active_raws:
+                chosen = self._choose_raw(active_raws)
+                basis = "single-source" if len(active_raws) == 1 else "default-priority"
+
+        return {
+            "rows": rows,
+            "candidates": candidates,
+            "saw_records": bool(quote_rows),
+            "status_events": status_events,
+            "chosen": chosen,
+            "basis": basis,
+            "decision": chosen_decision,
+        }
+
+    def _choose_raw(self, raws: list[sqlite3.Row]) -> sqlite3.Row:
+        def rank(row: sqlite3.Row) -> tuple:
+            priority = self.source_priority.get(row["source"], 10**9)
+            return (priority, row["source"], -int(row["seq"]))
+        return min(raws, key=rank)
 
     def _adjustment(
         self, security_id: str, business_date: _dt.date, known_at: _dt.datetime
@@ -220,26 +390,49 @@ class Dataset:
         """as-of 查询：在 known_at 时点，回看 business_date 当天可知的行情。"""
         bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
         ka = _parse_dt(known_at)
-        row = self._visible_event(security_id, bd.isoformat(), ka)
+        resolved = self._resolve(security_id, bd, ka)
+        chosen = resolved["chosen"]
+        status_events = resolved["status_events"]
 
-        if row is None:
+        saw_records = resolved["saw_records"]
+        if chosen is None and not status_events:
+            if saw_records:
+                status = QuoteStatus.WITHDRAWN
+                return QuoteView(
+                    security_id, bd, ka, status, None, None, "", "", None, "withdrawal",
+                    candidates=resolved["candidates"],
+                    selection_basis=resolved["basis"],
+                )
             if self.calendar.is_session(bd):
                 status = QuoteStatus.MISSING
             else:
                 status = QuoteStatus.NON_SESSION
             return QuoteView(
-                security_id, bd, ka, status, None, None, "", "", None, "none"
+                security_id, bd, ka, status, None, None, "", "", None, "none",
+                candidates=resolved["candidates"],
             )
 
-        kind = row["kind"]
-        if kind == "cancel":
-            status = QuoteStatus.CANCELLED
-            quote = None
-        elif kind == "suspension":
-            status = QuoteStatus.SUSPENDED
-            quote = None
+        latest_status = (
+            max(status_events, key=lambda r: (r["received_at"], r["seq"]))
+            if status_events else None
+        )
+        status_override = latest_status is not None and (
+            chosen is None
+            or (latest_status["received_at"], latest_status["seq"])
+            > (chosen["received_at"], chosen["seq"])
+        )
+
+        if status_override:
+            kind = latest_status["kind"]
+            if kind == "cancel":
+                status, quote = QuoteStatus.CANCELLED, None
+            else:
+                status, quote = QuoteStatus.SUSPENDED, None
+            row = latest_status
+        elif chosen is None:
+            status, quote, row = QuoteStatus.WITHDRAWN, None, None
         else:
-            status = QuoteStatus.OK
+            kind, status, row = chosen["kind"], QuoteStatus.OK, chosen
             quote = Quote(
                 row["open"], row["high"], row["low"], row["close"], row["volume"]
             )
@@ -256,10 +449,21 @@ class Dataset:
             status=status,
             quote=quote,
             adjusted_close=adjusted,
-            source=row["source"],
-            source_record=row["source_record"],
-            received_at=_parse_dt(row["received_at"]),
+            source=row["source"] if row else "",
+            source_record=row["source_record"] if row else "",
+            received_at=_parse_dt(row["received_at"]) if row else None,
             event_kind=kind,
+            candidates=resolved["candidates"],
+            adjudication_id=(resolved["decision"]["decision_id"]
+                             if resolved["decision"] else ""),
+            decision_received_at=(
+                _parse_dt(resolved["decision"]["decision_received_at"])
+                if resolved["decision"] else None
+            ),
+            decision_reason=(
+                resolved["decision"]["reason"] if resolved["decision"] else ""
+            ),
+            selection_basis=resolved["basis"],
         )
 
     def series(
@@ -289,6 +493,129 @@ class Dataset:
             (security_id, str(start), str(end)),
         )
         return [dict(r) for r in rows]
+
+    # ---------- 多历史视角复算与差异归因 ----------
+
+    def recompute_viewpoints(
+        self,
+        security_id: str,
+        business_date: str | _dt.date,
+        viewpoints,
+    ) -> list[dict]:
+        """在多个历史视角（known_at 列表）下复算同一业务日的行情结论。
+
+        每个视角都只依赖该时点之前实际收到的行情事件、撤回收达和裁决，
+        不使用任何后知信息。
+        """
+        out = []
+        for ka in viewpoints:
+            view = self.quote_at(security_id, business_date, ka)
+            out.append({"known_at": view.known_at, "view": view})
+        return out
+
+    @staticmethod
+    def _view_signature(view: QuoteView) -> dict:
+        return {
+            "status": view.status.value,
+            "close": view.quote.close if view.quote else None,
+            "adjusted_close": view.adjusted_close,
+            "source": view.source,
+            "source_record": view.source_record,
+            "event_kind": view.event_kind,
+            "selection_basis": view.selection_basis,
+            "adjudication_id": view.adjudication_id,
+            "active_records": tuple(
+                (c.source, c.source_record) for c in view.candidates if c.active
+            ),
+        }
+
+    def new_information(
+        self,
+        security_id: str,
+        business_date: str | _dt.date,
+        start: str | _dt.datetime,
+        end: str | _dt.datetime,
+    ) -> list[dict]:
+        """列出 (start, end] 区间内新增到达、且影响该业务日的信息。"""
+        bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
+        s, e = _parse_dt(start), _parse_dt(end)
+        events = []
+        for r in self.conn.execute(
+            "SELECT * FROM quote_event"
+            " WHERE security_id=? AND business_date=?"
+            " AND received_at > ? AND received_at <= ? ORDER BY received_at, seq",
+            (security_id, bd.isoformat(), s.isoformat(), e.isoformat()),
+        ):
+            events.append({
+                "type": "event", "kind": r["kind"],
+                "source": r["source"], "source_record": r["source_record"],
+                "target": [r["target_source"], r["target_record"]]
+                if r["kind"] == "withdrawal" else None,
+                "received_at": _parse_dt(r["received_at"]),
+                "reason": r["reason"],
+            })
+        for r in self.conn.execute(
+            "SELECT * FROM adjudication"
+            " WHERE security_id=? AND business_date=?"
+            " AND decision_received_at > ? AND decision_received_at <= ?"
+            " ORDER BY decision_received_at, seq",
+            (security_id, bd.isoformat(), s.isoformat(), e.isoformat()),
+        ):
+            events.append({
+                "type": "adjudication", "kind": "adjudication",
+                "decision_id": r["decision_id"],
+                "chosen": [r["chosen_source"], r["chosen_record"]],
+                "source": r["chosen_source"],
+                "source_record": r["chosen_record"],
+                "received_at": _parse_dt(r["decision_received_at"]),
+                "reason": r["reason"],
+            })
+        # 该区间内新收到、影响 business_date 复权的拆分公告
+        for r in self.conn.execute(
+            "SELECT ex_date, ratio, received_at FROM corp_split"
+            " WHERE security_id=? AND ex_date > ?"
+            " AND received_at > ? AND received_at <= ? ORDER BY received_at",
+            (security_id, bd.isoformat(), s.isoformat(), e.isoformat()),
+        ):
+            events.append({
+                "type": "split", "kind": "split",
+                "ex_date": _dt.date.fromisoformat(r["ex_date"]),
+                "ratio": r["ratio"],
+                "received_at": _parse_dt(r["received_at"]),
+                "source": "", "source_record": "",
+            })
+        return sorted(events, key=lambda x: x["received_at"])
+
+    def explain_viewpoint_diff(
+        self,
+        security_id: str,
+        business_date: str | _dt.date,
+        earlier: str | _dt.datetime,
+        later: str | _dt.datetime,
+    ) -> dict:
+        """说明两个历史视角之间结果差异具体来自哪次新增信息。
+
+        即使候选记录数量不变（如仅裁决改选或复权公告送达），
+        内容字段的变化也会被逐字段列出。
+        """
+        before = self.quote_at(security_id, business_date, earlier)
+        after = self.quote_at(security_id, business_date, later)
+        sig_before, sig_after = self._view_signature(before), self._view_signature(after)
+        changed = {
+            key: {"before": sig_before[key], "after": sig_after[key]}
+            for key in sig_before
+            if sig_before[key] != sig_after[key]
+        }
+        return {
+            "security_id": security_id,
+            "business_date": before.business_date,
+            "earlier": before.known_at,
+            "later": after.known_at,
+            "changed_fields": changed,
+            "new_information": self.new_information(
+                security_id, business_date, before.known_at, after.known_at
+            ),
+        }
 
     # ---------- 持久化 ----------
 
@@ -323,7 +650,8 @@ class Dataset:
     def snapshot_info(self) -> dict:
         """数据集指纹，保存后重开应保持一致。"""
         counts = {}
-        for table in ("security", "trading_session", "corp_split", "quote_event"):
+        for table in ("security", "trading_session", "corp_split",
+                      "quote_event", "adjudication"):
             counts[table] = self.conn.execute(
                 f"SELECT COUNT(*) FROM {table}"
             ).fetchone()[0]

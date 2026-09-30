@@ -1,5 +1,8 @@
 # 历史行情研究系统（首轮）
 
+> 第二轮新增：**跨来源冲突裁决**与**来源撤回**，并支持在多个历史视角复算、
+> 逐字段归因结果差异（`examples/demo_conflict.py`，`tests/test_conflict_withdrawal.py`）。
+
 纯 Python 标准库 + SQLite，离线运行，不联网下载任何行情。核心解决一个问题：
 **回测站在某个历史时点，只能看到当时实际已经收到的数据；后来补齐的价格、迟到的修订、事后才公告的拆分因子都不能被提前使用。**
 
@@ -40,10 +43,40 @@
 `adjusted_close = close / 因子积`，因子只统计「除权日晚于该业务日」且
 「公告收到时间 <= known_at」的拆分。公告送达前，回测看不到复权调整。
 
+## 跨来源冲突裁决
+
+- 同一 (证券, 业务日) 可同时存在多个来源的报价；每条来源原记录都作为
+  **候选**（`QuoteView.candidates`）永久保留，绝不因裁决而删除。
+- 无裁决时按 `set_source_priority({"A":1,"B":2})` 的来源优先级决胜，
+  `selection_basis` 标明 single-source / default-priority / revision / adjudicated。
+- 裁决用 `Adjudication` 追加：只引用“采用哪条来源记录”并写明原因；
+  裁决自身有 decision_received_at，在该时点之前的历史视角看不到它。
+- 裁决是 append-only：后来改判（新 Adjudication）不会抹掉旧版本，
+  用旧 known_at 复算仍能看到当时的结论与所依据的裁决号。
+- 已被有效裁决锁定的记录，不会被之后到达的新原始报价自动翻转。
+
+## 来源撤回
+
+- kind="withdrawal" 事件通过 target_source / target_record **精确撤回**
+  某条来源记录，不影响其他来源；撤回同样受收到时间约束。
+- 被撤回记录仍出现在候选列表中，active=False、withdrawn_by 指向撤回通知。
+- 所有候选都被撤回时状态为 withdrawn；撤回通知到达前，旧结论照常可复算。
+
+## 多历史视角复算与差异归因
+
+- `recompute_viewpoints(sec, date, [known_at, ...])` 在多个历史视角重放同一业务日。
+- `explain_viewpoint_diff(sec, date, earlier, later)` 返回：
+  - changed_fields：逐字段的 before/after（状态、价格、复权、采用记录、
+    依据、裁决号、活跃候选集合）；
+  - new_information：区间内实际到达的行情事件 / 撤回 / 裁决 / 拆分公告。
+- 因此即使记录数量不变（仅裁决改选、或仅拆分公告送达导致复权值变化），
+  也能区分内容变化，并指认它具体来自哪一次新增信息。
+
 ## 快速开始
 
 ```bash
 .venv/bin/python -m examples.demo
+.venv/bin/python -m examples.demo_conflict
 .venv/bin/python -m unittest discover -s tests
 ```
 

@@ -4,17 +4,20 @@
 的数据，后来补齐或修订的价格不可见。
 """
 
+from .adjudication import Adjudication
 from .dataset import Dataset
 from .identity import Security, Split
 from .quote import Quote, QuoteEvent, QuoteStatus
-from .query import QuoteView
+from .query import QuoteView, SourceCandidate
 
 __all__ = [
     "Dataset",
+    "Adjudication",
     "Security",
     "Split",
     "Quote",
     "QuoteEvent",
     "QuoteStatus",
     "QuoteView",
+    "SourceCandidate",
 ]
