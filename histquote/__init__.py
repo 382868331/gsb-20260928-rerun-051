@@ -6,15 +6,18 @@
 
 from .dataset import Dataset
 from .identity import Security, Split
-from .quote import Quote, QuoteEvent, QuoteStatus
+from .quote import Quote, QuoteCandidate, QuoteEvent, QuoteStatus
 from .query import QuoteView
+from .source import SourceInfo
 
 __all__ = [
     "Dataset",
     "Security",
     "Split",
     "Quote",
+    "QuoteCandidate",
     "QuoteEvent",
     "QuoteStatus",
     "QuoteView",
+    "SourceInfo",
 ]

@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as _dt
 
-from .quote import Quote, QuoteStatus
+from .quote import Quote, QuoteCandidate, QuoteStatus
 
 
 @dataclasses.dataclass(frozen=True)
@@ -22,6 +22,9 @@ class QuoteView:
     source_record: str
     received_at: _dt.datetime | None
     event_kind: str
+    decision_reason: str = ""
+    conflict: bool = False
+    candidates: tuple[QuoteCandidate, ...] = ()
 
     def as_dict(self) -> dict:
         q = dataclasses.asdict(self.quote) if self.quote else None
@@ -36,4 +39,18 @@ class QuoteView:
             "source_record": self.source_record,
             "received_at": self.received_at.isoformat() if self.received_at else None,
             "event_kind": self.event_kind,
+            "decision_reason": self.decision_reason,
+            "conflict": self.conflict,
+            "candidates": [
+                {
+                    "source": c.source,
+                    "source_record": c.source_record,
+                    "kind": c.kind,
+                    "received_at": c.received_at.isoformat(),
+                    "quote": dataclasses.asdict(c.quote) if c.quote else None,
+                    "state": c.state,
+                    "reason": c.reason,
+                }
+                for c in self.candidates
+            ],
         }

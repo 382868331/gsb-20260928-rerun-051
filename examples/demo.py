@@ -9,7 +9,9 @@ import datetime as dt
 import tempfile
 from pathlib import Path
 
-from histquote import Dataset, Quote, QuoteEvent, QuoteStatus, Security, Split
+from histquote import (
+    Dataset, Quote, QuoteEvent, QuoteStatus, Security, SourceInfo, Split,
+)
 
 
 def build() -> Dataset:
@@ -22,12 +24,24 @@ def build() -> Dataset:
     ds.calendar.add_sessions(
         [dt.date(2024, 1, d) for d in (8, 9, 10, 11, 12)]
     )
+    ds.add_source(SourceInfo("exchange-feed", "交易所原始行情", priority=100),
+                  dt.datetime(2024, 1, 1))
+    ds.add_source(SourceInfo("exchange-correction", "交易所修订", priority=110),
+                  dt.datetime(2024, 1, 1))
+    ds.add_source(SourceInfo("vendor-batch", "第三方批量转发", priority=50),
+                  dt.datetime(2024, 1, 1))
 
     # --- sec_x：原始 -> 重复 -> 修订（迟到更正）---
     ds.add_event(QuoteEvent(
         "sec_x", dt.date(2024, 1, 8), dt.datetime(2024, 1, 8, 15, 30),
         kind="raw", quote=Quote(10.0, 10.2, 9.9, 10.1, 1_000_000),
         source="exchange-feed", source_record="x-20240108-v1",
+    ))
+    # 第三方 16:05 转发了不同价格；来源优先级较低，两条原记录都保留。
+    ds.add_event(QuoteEvent(
+        "sec_x", dt.date(2024, 1, 8), dt.datetime(2024, 1, 8, 16, 5),
+        kind="raw", quote=Quote(10.0, 10.15, 9.85, 10.05, 950_000),
+        source="vendor-batch", source_record="x-v-20240108-v1",
     ))
     # 重放/重复推送：同来源同记录号、同内容 -> 幂等忽略，不产生第二条
     ds.add_event(QuoteEvent(
@@ -41,6 +55,13 @@ def build() -> Dataset:
         kind="revision", quote=Quote(10.0, 10.2, 9.8, 9.8, 1_000_000),
         reason="收盘统计更正", source="exchange-correction",
         source_record="x-20240108-v2",
+    ))
+    # 次日晚间第三方撤回自己的冲突转发；此时官方修订仍有效。
+    ds.add_event(QuoteEvent(
+        "sec_x", dt.date(2024, 1, 8), dt.datetime(2024, 1, 9, 19, 0),
+        kind="retraction", quote=None, reason="转发源撤回合入价格",
+        source="vendor-batch", source_record="x-v-retract-1",
+        target_source="vendor-batch", target_record="x-v-20240108-v1",
     ))
 
     # --- sec_x：01-10 停牌 ---
@@ -102,7 +123,23 @@ def main() -> None:
     for row in ds.received_log("sec_x", dt.datetime(2024, 1, 8), dt.datetime(2024, 1, 10)):
         print("   ", row["received_at"], row["kind"], "close=", row["close"], row["source_record"])
 
-    print("== 7) 保存数据集并重开，查询与来源一致 ==")
+    print("== 7) 跨来源冲突：保留两条原记录，按当时来源优先级裁决 ==")
+    v = ds.quote_at("sec_x", dt.date(2024, 1, 8), dt.datetime(2024, 1, 8, 17))
+    print(f"   close={v.quote.close} conflict={v.conflict} 采用={v.source}/{v.source_record}")
+    print("   ", v.decision_reason)
+
+    print("== 8) 多视角复算：把内容变化归因到撤回/修订/拆分 ==")
+    change = ds.explain_change(
+        "sec_y", dt.date(2024, 1, 9), dt.date(2024, 1, 10),
+        dt.datetime(2024, 1, 10), dt.datetime(2024, 1, 12, 12),
+    )
+    print("   content_changed=", change["content_changed"],
+          "新增拆分=", [s["ex_date"] for s in change["new_split_announcements"]])
+    for diff in change["views_diff"]:
+        print("   ", diff["business_date"],
+              diff["before"]["adjusted_close"], "->", diff["after"]["adjusted_close"])
+
+    print("== 9) 保存数据集并重开，查询与来源一致 ==")
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "research.db"
         saved = build()
