@@ -3,6 +3,11 @@
 > 第二轮新增：**跨来源冲突裁决**与**来源撤回**，并支持在多个历史视角复算、
 > 逐字段归因结果差异（`examples/demo_conflict.py`，`tests/test_conflict_withdrawal.py`）。
 
+> 第三轮新增：**来源选择规则自身的历史有效范围**。优先级偏好也是有收到时间、
+> 有修订身份的事实：今天改偏好不会改写过去已能看到的结论；支持规则调整前后的
+> 研究对照、按新规则对旧时点重研、规则回退保留新修订身份
+> （`examples/demo_rule_history.py`，`tests/test_source_rule_history.py`）。
+
 纯 Python 标准库 + SQLite，离线运行，不联网下载任何行情。核心解决一个问题：
 **回测站在某个历史时点，只能看到当时实际已经收到的数据；后来补齐的价格、迟到的修订、事后才公告的拆分因子都不能被提前使用。**
 
@@ -72,11 +77,31 @@
 - 因此即使记录数量不变（仅裁决改选、或仅拆分公告送达导致复权值变化），
   也能区分内容变化，并指认它具体来自哪一次新增信息。
 
+## 来源选择规则的历史有效范围（第三轮）
+
+- 偏好不能穿越：`set_source_priority` 只是内存中的**基线配置**；持久化规则用
+  `add_source_rule(SourceRule(rule_id, received_at, priority, ...))` 追加，规则在
+  `received_at` 之前的历史视角不可见。重复查询旧时点，价格不会因今天改偏好而变化。
+- 原历史视角默认严格：`quote_at(sec, date, known_at)` 只采用 `known_at` 时已经
+  生效的那一版规则；`QuoteView.rule_id` 记录本结论实际使用的规则修订身份。
+- 按新规则重新研究：`quote_at(..., rule_id="rule-x")` 把来源选择规则替换为指定
+  修订，但行情、撤回、裁决、拆分公告的可见性仍严格以 `known_at` 为界。
+- 研究对照：`research_comparison(sec, date, known_at, new_rule_id=...)` 同时给出
+  “保持原历史视角”与“按新规则重研”两份结果及逐字段差异；
+  `research_comparison_series` 支持多个研究时点。
+- 回退也是修订：把配置改回旧内容必须使用**新的 `rule_id`**（身份永不回退），
+  可用 `restores_rule_id` 标注恢复了哪份旧配置；`source_rule_history()` 列出修订链。
+- 可见性追溯：`information_timeline(sec, date)` 按时间列出原始价格、修订、撤回、
+  停牌/撤销、裁决、拆分公告、规则修订各自**何时对研究系统可见**。
+- 规则修订 append-only 且随库持久化：同 `rule_id` 重放幂等、内容不同抛错；
+  保存重开与重复查询后，`snapshot_info()` 指纹与原研究版本均保持不变。
+
 ## 快速开始
 
 ```bash
 .venv/bin/python -m examples.demo
 .venv/bin/python -m examples.demo_conflict
+.venv/bin/python -m examples.demo_rule_history
 .venv/bin/python -m unittest discover -s tests
 ```
 

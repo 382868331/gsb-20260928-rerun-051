@@ -40,6 +40,7 @@ class QuoteView:
     decision_received_at: _dt.datetime | None = None
     decision_reason: str = ""
     selection_basis: str = ""   # single-source / default-priority / adjudicated
+    rule_id: str = ""          # 本次来源选择所用的规则修订身份（基线配置为 ""）
 
     def as_dict(self) -> dict:
         q = dataclasses.asdict(self.quote) if self.quote else None
@@ -62,4 +63,5 @@ class QuoteView:
             ),
             "decision_reason": self.decision_reason,
             "selection_basis": self.selection_basis,
+            "rule_id": self.rule_id,
         }

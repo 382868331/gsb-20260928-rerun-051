@@ -21,8 +21,9 @@ from .adjudication import Adjudication
 from .identity import Security, Split
 from .query import QuoteView, SourceCandidate
 from .quote import Quote, QuoteEvent, QuoteStatus
+from .rules import SourceRule
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _parse_dt(value: str | _dt.datetime) -> _dt.datetime:
@@ -79,6 +80,16 @@ CREATE TABLE IF NOT EXISTS adjudication(
 );
 CREATE INDEX IF NOT EXISTS idx_adjudication_asof
     ON adjudication(security_id, business_date, decision_received_at, seq);
+CREATE TABLE IF NOT EXISTS source_rule(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id TEXT NOT NULL UNIQUE,
+    received_at TEXT NOT NULL,
+    priority_json TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    restores_rule_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_source_rule_asof
+    ON source_rule(received_at, seq);
 """
 
 _EXTRA_COLUMNS = {
@@ -113,10 +124,124 @@ class Dataset:
                 if column not in existing:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
         self.conn.commit()
+        self.conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'",
+            (str(SCHEMA_VERSION),),
+        )
+        self.conn.commit()
 
     def set_source_priority(self, priority: dict[str, int]) -> None:
-        """设置来源优先级；未列出的来源排在其后并按来源名字典序决胜。"""
+        """设置基线来源优先级（内存态）。
+
+        仅用于尚未收到任何持久化规则修订（add_source_rule）的时期，
+        以及对旧快照的兼容；不会被当作某次“修订”记录，也不会改变历史
+        视角的结果。需要带身份、带生效时间、可保存的规则请用 add_source_rule。
+        """
         self.source_priority = dict(priority)
+
+    # ---------- 来源选择规则（双时态修订） ----------
+
+    def add_source_rule(self, rule: SourceRule) -> tuple[bool, int | None]:
+        """追加一版来源选择规则修订。
+
+        规则在其 received_at 之前的历史视角不可见；append-only，永不就地
+        覆盖。同一 rule_id 重放且内容一致时幂等忽略，内容不同则抛错。
+        把配置改回旧版本的内容也必须使用新的 rule_id（修订身份不回退），
+        可用 restores_rule_id 标注本次恢复的是哪份旧配置。
+        """
+        payload = json.dumps(
+            {
+                "priority": rule.priority_items(),
+                "received_at": rule.received_at.isoformat(),
+                "reason": rule.reason,
+                "restores_rule_id": rule.restores_rule_id,
+            },
+            sort_keys=True, ensure_ascii=False,
+        )
+        existing = self.conn.execute(
+            "SELECT seq, priority_json, received_at, reason, restores_rule_id"
+            " FROM source_rule WHERE rule_id=?",
+            (rule.rule_id,),
+        ).fetchone()
+        if existing is not None:
+            old_payload = json.dumps(
+                {
+                    "priority": tuple(sorted(
+                        (s, int(r)) for s, r in json.loads(existing["priority_json"])
+                    )),
+                    "received_at": existing["received_at"],
+                    "reason": existing["reason"],
+                    "restores_rule_id": existing["restores_rule_id"],
+                },
+                sort_keys=True, ensure_ascii=False,
+            )
+            if old_payload != payload:
+                raise ValueError(
+                    f"规则修订 {rule.rule_id} 已存在且内容不同，修订不可覆盖")
+            return False, existing["seq"]
+        cur = self.conn.execute(
+            "INSERT INTO source_rule(rule_id, received_at, priority_json, reason,"
+            " restores_rule_id) VALUES (?,?,?,?,?)",
+            (
+                rule.rule_id,
+                rule.received_at.isoformat(),
+                json.dumps(rule.priority_items(), ensure_ascii=False),
+                rule.reason,
+                rule.restores_rule_id,
+            ),
+        )
+        self.conn.commit()
+        return True, cur.lastrowid
+
+    def source_rule_history(self) -> list[dict]:
+        """按生效顺序返回全部规则修订（含回退留痕），重开后保持不变。"""
+        rows = self.conn.execute(
+            "SELECT * FROM source_rule ORDER BY received_at, seq"
+        )
+        return [self._rule_row_to_dict(r) for r in rows]
+
+    @staticmethod
+    def _rule_row_to_dict(row: sqlite3.Row) -> dict:
+        return {
+            "rule_id": row["rule_id"],
+            "received_at": _parse_dt(row["received_at"]),
+            "priority": {s: int(r) for s, r in json.loads(row["priority_json"])},
+            "reason": row["reason"],
+            "restores_rule_id": row["restores_rule_id"],
+        }
+
+    def _rule_asof(self, known_at: _dt.datetime) -> sqlite3.Row | None:
+        """known_at 时点实际已生效的最新一版规则（历史视角）。"""
+        return self.conn.execute(
+            "SELECT * FROM source_rule WHERE received_at <= ?"
+            " ORDER BY received_at DESC, seq DESC LIMIT 1",
+            (known_at.isoformat(),),
+        ).fetchone()
+
+    def _rule_by_id(self, rule_id: str) -> sqlite3.Row:
+        row = self.conn.execute(
+            "SELECT * FROM source_rule WHERE rule_id=?", (rule_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"规则修订不存在: {rule_id}")
+        return row
+
+    def _effective_rule(
+        self, known_at: _dt.datetime, rule_id: str | None
+    ) -> tuple[dict[str, int], sqlite3.Row | None]:
+        """确定本次裁决使用的优先级配置及其修订身份。
+
+        rule_id 为 None 时严格按历史视角：只采用 known_at 之前已生效的规则；
+        显式给出 rule_id 表示“拿今天的新偏好重新研究过去时点”——行情可见性
+        仍严格受 known_at 约束，仅来源选择规则被替换为该修订版本。
+        """
+        if rule_id is not None:
+            row = self._rule_by_id(rule_id)
+            return {s: int(r) for s, r in json.loads(row["priority_json"])}, row
+        row = self._rule_asof(known_at)
+        if row is None:
+            return dict(self.source_priority), None
+        return {s: int(r) for s, r in json.loads(row["priority_json"])}, row
 
     # ---------- 基础信息 ----------
 
@@ -286,7 +411,11 @@ class Dataset:
         return row["source"], row["source_record"]
 
     def _resolve(
-        self, security_id: str, bd: _dt.date, known_at: _dt.datetime
+        self,
+        security_id: str,
+        bd: _dt.date,
+        known_at: _dt.datetime,
+        priority: dict[str, int] | None = None,
     ) -> dict:
         """合并截至 known_at 可见的全部事件，输出候选与裁决结果。
 
@@ -348,7 +477,7 @@ class Dataset:
                 chosen = max(active_revisions, key=lambda r: (r["received_at"], r["seq"]))
                 basis = "revision"
             elif active_raws:
-                chosen = self._choose_raw(active_raws)
+                chosen = self._choose_raw(active_raws, priority)
                 basis = "single-source" if len(active_raws) == 1 else "default-priority"
 
         return {
@@ -361,10 +490,15 @@ class Dataset:
             "decision": chosen_decision,
         }
 
-    def _choose_raw(self, raws: list[sqlite3.Row]) -> sqlite3.Row:
+    def _choose_raw(
+        self,
+        raws: list[sqlite3.Row],
+        priority: dict[str, int] | None = None,
+    ) -> sqlite3.Row:
         def rank(row: sqlite3.Row) -> tuple:
-            priority = self.source_priority.get(row["source"], 10**9)
-            return (priority, row["source"], -int(row["seq"]))
+            effective = self.source_priority if priority is None else priority
+            rank_value = effective.get(row["source"], 10**9)
+            return (rank_value, row["source"], -int(row["seq"]))
         return min(raws, key=rank)
 
     def _adjustment(
@@ -386,11 +520,19 @@ class Dataset:
         security_id: str,
         business_date: str | _dt.date,
         known_at: str | _dt.datetime,
+        rule_id: str | None = None,
     ) -> QuoteView:
-        """as-of 查询：在 known_at 时点，回看 business_date 当天可知的行情。"""
+        """as-of 查询：在 known_at 时点，回看 business_date 当天可知的行情。
+
+        rule_id=None 时保持原历史视角：来源选择规则也只取 known_at 时已经
+        生效的修订，今天的偏好不会改写过去看到的结果。显式传入 rule_id
+        表示按该版规则“重新研究”：行情/撤回/裁决/拆分公告的可见性仍严格
+        以 known_at 为准，仅来源选择规则替换为该修订（哪怕它当时尚未生效）。
+        """
         bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
         ka = _parse_dt(known_at)
-        resolved = self._resolve(security_id, bd, ka)
+        priority, rule_row = self._effective_rule(ka, rule_id)
+        resolved = self._resolve(security_id, bd, ka, priority)
         chosen = resolved["chosen"]
         status_events = resolved["status_events"]
 
@@ -402,6 +544,7 @@ class Dataset:
                     security_id, bd, ka, status, None, None, "", "", None, "withdrawal",
                     candidates=resolved["candidates"],
                     selection_basis=resolved["basis"],
+                    rule_id=rule_row["rule_id"] if rule_row else "",
                 )
             if self.calendar.is_session(bd):
                 status = QuoteStatus.MISSING
@@ -410,6 +553,7 @@ class Dataset:
             return QuoteView(
                 security_id, bd, ka, status, None, None, "", "", None, "none",
                 candidates=resolved["candidates"],
+                rule_id=rule_row["rule_id"] if rule_row else "",
             )
 
         latest_status = (
@@ -464,6 +608,7 @@ class Dataset:
                 resolved["decision"]["reason"] if resolved["decision"] else ""
             ),
             selection_basis=resolved["basis"],
+            rule_id=rule_row["rule_id"] if rule_row else "",
         )
 
     def series(
@@ -501,6 +646,7 @@ class Dataset:
         security_id: str,
         business_date: str | _dt.date,
         viewpoints,
+        rule_id: str | None = None,
     ) -> list[dict]:
         """在多个历史视角（known_at 列表）下复算同一业务日的行情结论。
 
@@ -509,7 +655,7 @@ class Dataset:
         """
         out = []
         for ka in viewpoints:
-            view = self.quote_at(security_id, business_date, ka)
+            view = self.quote_at(security_id, business_date, ka, rule_id=rule_id)
             out.append({"known_at": view.known_at, "view": view})
         return out
 
@@ -524,6 +670,7 @@ class Dataset:
             "event_kind": view.event_kind,
             "selection_basis": view.selection_basis,
             "adjudication_id": view.adjudication_id,
+            "rule_id": view.rule_id,
             "active_records": tuple(
                 (c.source, c.source_record) for c in view.candidates if c.active
             ),
@@ -584,6 +731,22 @@ class Dataset:
                 "received_at": _parse_dt(r["received_at"]),
                 "source": "", "source_record": "",
             })
+        # 该区间内新生效的来源选择规则修订（会改变 default-priority 的选择）
+        for r in self.conn.execute(
+            "SELECT rule_id, received_at, reason, priority_json, restores_rule_id"
+            " FROM source_rule WHERE received_at > ? AND received_at <= ?"
+            " ORDER BY received_at, seq",
+            (s.isoformat(), e.isoformat()),
+        ):
+            events.append({
+                "type": "rule", "kind": "rule",
+                "rule_id": r["rule_id"],
+                "priority": {x: int(y) for x, y in json.loads(r["priority_json"])},
+                "restores_rule_id": r["restores_rule_id"],
+                "received_at": _parse_dt(r["received_at"]),
+                "reason": r["reason"],
+                "source": "", "source_record": "",
+            })
         return sorted(events, key=lambda x: x["received_at"])
 
     def explain_viewpoint_diff(
@@ -616,6 +779,134 @@ class Dataset:
                 security_id, business_date, before.known_at, after.known_at
             ),
         }
+
+    # ---------- 规则调整前后的研究对照 ----------
+
+    def research_comparison(
+        self,
+        security_id: str,
+        business_date: str | _dt.date,
+        known_at: str | _dt.datetime,
+        new_rule_id: str,
+    ) -> dict:
+        """同一研究时点的“原历史视角” vs “按新规则重新研究”对照。
+
+        - historical：known_at 当时实际生效的规则下看到的结果。规则在
+          known_at 之后才生效时，historical 不受其影响（价格保持不变）。
+        - revised：显式采用 new_rule_id 重新研究同一时点的结果；行情事件、
+          撤回、裁决、拆分公告的可见性仍严格以 known_at 为界。
+        两份结论各自记录所用规则身份，便于追溯同一次价格为何不同。
+        """
+        ka = _parse_dt(known_at)
+        historical = self.quote_at(security_id, business_date, ka)
+        revised = self.quote_at(
+            security_id, business_date, ka, rule_id=new_rule_id)
+        return {
+            "security_id": security_id,
+            "business_date": historical.business_date,
+            "known_at": ka,
+            "new_rule_id": new_rule_id,
+            "historical": {
+                "view": historical,
+                "rule_id": historical.rule_id,
+            },
+            "revised": {
+                "view": revised,
+                "rule_id": revised.rule_id,
+            },
+            "changed_fields": self._compare_views(historical, revised),
+        }
+
+    def research_comparison_series(
+        self,
+        security_id: str,
+        business_date: str | _dt.date,
+        viewpoints,
+        new_rule_id: str,
+    ) -> list[dict]:
+        """在多个研究时点上分别给出原视角与新规则重研结果（逐视角对照）。"""
+        return [
+            self.research_comparison(
+                security_id, business_date, ka, new_rule_id=new_rule_id)
+            for ka in viewpoints
+        ]
+
+    def _compare_views(self, before: QuoteView, after: QuoteView) -> dict:
+        sig_before, sig_after = self._view_signature(before), self._view_signature(after)
+        return {
+            key: {"before": sig_before[key], "after": sig_after[key]}
+            for key in sig_before
+            if sig_before[key] != sig_after[key]
+        }
+
+    def information_timeline(
+        self,
+        security_id: str,
+        business_date: str | _dt.date,
+    ) -> list[dict]:
+        """列出与该 (证券, 业务日) 研究相关的每条信息何时对研究系统可见。
+
+        覆盖：原始价格(raw)、修订(revision)、停牌(suspension)、撤销(cancel)、
+        来源撤回(withdrawal)、冲突裁决(adjudication)、拆分公告(split)、
+        来源选择规则修订(rule)。按收到/生效时间排序，供追溯对照。
+        """
+        bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
+        bd_s = bd.isoformat()
+        items: list[dict] = []
+        for r in self.conn.execute(
+            "SELECT * FROM quote_event WHERE security_id=? AND business_date=?"
+            " ORDER BY received_at, seq",
+            (security_id, bd_s),
+        ):
+            items.append({
+                "type": "event",
+                "kind": r["kind"],
+                "visible_at": _parse_dt(r["received_at"]),
+                "source": r["source"],
+                "source_record": r["source_record"],
+                "close": r["close"],
+                "target": [r["target_source"], r["target_record"]]
+                if r["kind"] == "withdrawal" else None,
+                "reason": r["reason"],
+            })
+        for r in self.conn.execute(
+            "SELECT * FROM adjudication WHERE security_id=? AND business_date=?"
+            " ORDER BY decision_received_at, seq",
+            (security_id, bd_s),
+        ):
+            items.append({
+                "type": "adjudication",
+                "kind": "adjudication",
+                "visible_at": _parse_dt(r["decision_received_at"]),
+                "decision_id": r["decision_id"],
+                "chosen": [r["chosen_source"], r["chosen_record"]],
+                "reason": r["reason"],
+            })
+        for r in self.conn.execute(
+            "SELECT ex_date, ratio, received_at FROM corp_split"
+            " WHERE security_id=? AND ex_date > ? ORDER BY received_at",
+            (security_id, bd_s),
+        ):
+            items.append({
+                "type": "split",
+                "kind": "split",
+                "visible_at": _parse_dt(r["received_at"]),
+                "ex_date": _dt.date.fromisoformat(r["ex_date"]),
+                "ratio": r["ratio"],
+            })
+        for r in self.conn.execute(
+            "SELECT * FROM source_rule ORDER BY received_at, seq"
+        ):
+            items.append({
+                "type": "rule",
+                "kind": "rule",
+                "visible_at": _parse_dt(r["received_at"]),
+                "rule_id": r["rule_id"],
+                "priority": {s: int(v) for s, v in json.loads(r["priority_json"])},
+                "restores_rule_id": r["restores_rule_id"],
+                "reason": r["reason"],
+            })
+        return sorted(items, key=lambda x: x["visible_at"])
 
     # ---------- 持久化 ----------
 
@@ -651,7 +942,7 @@ class Dataset:
         """数据集指纹，保存后重开应保持一致。"""
         counts = {}
         for table in ("security", "trading_session", "corp_split",
-                      "quote_event", "adjudication"):
+                      "quote_event", "adjudication", "source_rule"):
             counts[table] = self.conn.execute(
                 f"SELECT COUNT(*) FROM {table}"
             ).fetchone()[0]
@@ -660,7 +951,16 @@ class Dataset:
                 "SELECT content_hash FROM quote_event ORDER BY seq"
             )
         )
-        digest = hashlib.sha256("".join(hashes).encode("utf-8")).hexdigest()
+        rule_payload = (
+            r[0] for r in self.conn.execute(
+                "SELECT rule_id || '|' || received_at || '|' || priority_json"
+                " || '|' || COALESCE(restores_rule_id,'')"
+                " FROM source_rule ORDER BY seq"
+            )
+        )
+        digest = hashlib.sha256(
+            ("".join(hashes) + "".join(rule_payload)).encode("utf-8")
+        ).hexdigest()
         return {"name": self.name, "schema_version": SCHEMA_VERSION, "counts": counts,
                 "event_digest": digest}
 

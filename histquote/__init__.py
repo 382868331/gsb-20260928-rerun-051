@@ -9,6 +9,7 @@ from .dataset import Dataset
 from .identity import Security, Split
 from .quote import Quote, QuoteEvent, QuoteStatus
 from .query import QuoteView, SourceCandidate
+from .rules import SourceRule
 
 __all__ = [
     "Dataset",
@@ -20,4 +21,5 @@ __all__ = [
     "QuoteStatus",
     "QuoteView",
     "SourceCandidate",
+    "SourceRule",
 ]
