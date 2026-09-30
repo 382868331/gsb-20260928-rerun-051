@@ -40,6 +40,7 @@ class QuoteView:
     decision_received_at: _dt.datetime | None = None
     decision_reason: str = ""
     selection_basis: str = ""   # single-source / default-priority / adjudicated
+    priority_rule_id: str = ""  # 本次裁决实际采用的优先级规则（空 = 内存默认配置）
 
     def as_dict(self) -> dict:
         q = dataclasses.asdict(self.quote) if self.quote else None
@@ -62,4 +63,5 @@ class QuoteView:
             ),
             "decision_reason": self.decision_reason,
             "selection_basis": self.selection_basis,
+            "priority_rule_id": self.priority_rule_id,
         }

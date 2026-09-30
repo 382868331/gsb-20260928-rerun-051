@@ -2,6 +2,9 @@
 
 > 第二轮新增：**跨来源冲突裁决**与**来源撤回**，并支持在多个历史视角复算、
 > 逐字段归因结果差异（`examples/demo_conflict.py`，`tests/test_conflict_withdrawal.py`）。
+>
+> 第三轮新增：**来源优先级规则的历史有效范围**与**规则调整前后的研究对照**
+> （`examples/demo_priority_rules.py`，`tests/test_priority_rules.py`）。
 
 纯 Python 标准库 + SQLite，离线运行，不联网下载任何行情。核心解决一个问题：
 **回测站在某个历史时点，只能看到当时实际已经收到的数据；后来补齐的价格、迟到的修订、事后才公告的拆分因子都不能被提前使用。**
@@ -72,11 +75,28 @@
 - 因此即使记录数量不变（仅裁决改选、或仅拆分公告送达导致复权值变化），
   也能区分内容变化，并指认它具体来自哪一次新增信息。
 
+## 来源优先级规则的历史有效范围
+
+- `add_priority_rule(PriorityRule(priority, received_at, reason, rule_id))`
+  追加一条优先级修订，自 `received_at` 起生效；规则 append-only，
+  之前的历史视角仍按当时已生效的规则裁决，**今天的偏好不会改写过去
+  已经能看到的结果**。未登记规则时沿用 `set_source_priority` 的内存默认配置。
+- `rollback_source_priority(rule_id, received_at, ...)` 回退到旧配置，
+  但回退本身是一次**保留身份的新修订**（新 rule_id + supersedes 链），
+  旧规则原样保留；规则随库保存，重开与重复查询后各研究版本不变。
+- `compare_rule_adjustment(sec, date, known_at, rules_as_of=None)` 输出
+  规则调整前后的研究对照：`original` 保持原历史视角，`revised` 按新规则
+  重新研究同一时点（数据可见性不变），并给出逐字段 `changed_fields`。
+- `information_timeline(sec, date)` 按收到时间列出价格、撤回、修订、
+  拆分公告与优先级规则修订，各自何时可见一目了然。
+- `QuoteView.priority_rule_id` 标明本次裁决实际采用的规则。
+
 ## 快速开始
 
 ```bash
 .venv/bin/python -m examples.demo
 .venv/bin/python -m examples.demo_conflict
+.venv/bin/python -m examples.demo_priority_rules
 .venv/bin/python -m unittest discover -s tests
 ```
 

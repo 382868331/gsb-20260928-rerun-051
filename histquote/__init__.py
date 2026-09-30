@@ -7,12 +7,14 @@
 from .adjudication import Adjudication
 from .dataset import Dataset
 from .identity import Security, Split
+from .priority import PriorityRule
 from .quote import Quote, QuoteEvent, QuoteStatus
 from .query import QuoteView, SourceCandidate
 
 __all__ = [
     "Dataset",
     "Adjudication",
+    "PriorityRule",
     "Security",
     "Split",
     "Quote",
