@@ -14,6 +14,9 @@ class QuoteStatus(str, enum.Enum):
     SUSPENDED = "suspended"  # 当日停牌
     MISSING = "missing"      # 开市日但截至该时点尚未收到任何数据
     NON_SESSION = "non_session"
+    IDENTITY_CANDIDATE = "identity_candidate"
+    IDENTITY_UNKNOWN = "identity_unknown"
+    IDENTITY_AMBIGUOUS = "identity_ambiguous"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,3 +55,30 @@ class QuoteEvent:
             raise ValueError(f"{self.kind} 事件必须携带行情")
         if self.kind == "withdrawal" and not (self.target_source and self.target_record):
             raise ValueError("withdrawal 事件必须指定 target_source / target_record")
+
+
+@dataclasses.dataclass(frozen=True)
+class CodeQuoteEvent:
+    """按外部显示代码收到的原始行情；身份须经公告按业务日解释。"""
+
+    display_code: str
+    business_date: _dt.date
+    received_at: _dt.datetime
+    kind: str = "raw"
+    quote: Quote | None = None
+    market: str = ""
+    reason: str = ""
+    source: str = ""
+    source_record: str = ""
+    target_source: str = ""
+    target_record: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"raw", "revision", "withdrawal"}:
+            raise ValueError("代码报价事件只支持 raw / revision / withdrawal")
+        if self.kind in {"raw", "revision"} and self.quote is None:
+            raise ValueError(f"{self.kind} 代码报价事件必须携带行情")
+        if self.kind == "withdrawal" and not (self.target_source and self.target_record):
+            raise ValueError("代码报价撤回必须指定 target_source / target_record")
+        if not self.display_code:
+            raise ValueError("代码报价事件必须包含显示代码")

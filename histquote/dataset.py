@@ -8,6 +8,7 @@ as-of 查询只取 received_at <= known_at 的最后一条有效事件。
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime as _dt
 import hashlib
 import json
@@ -18,12 +19,12 @@ from pathlib import Path
 
 from .calendar import TradingCalendar
 from .adjudication import Adjudication
-from .identity import Security, Split
+from .identity import IdentityAnnouncement, IdentityResolution, Security, Split
 from .priority import PriorityRule
 from .query import QuoteView, SourceCandidate
-from .quote import Quote, QuoteEvent, QuoteStatus
+from .quote import CodeQuoteEvent, Quote, QuoteEvent, QuoteStatus
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _parse_dt(value: str | _dt.datetime) -> _dt.datetime:
@@ -34,6 +35,25 @@ def _quote_to_tuple(q: Quote | None) -> tuple:
     if q is None:
         return (None, None, None, None, None)
     return (q.open, q.high, q.low, q.close, q.volume)
+
+
+def _date_from_row(row: sqlite3.Row, key: str) -> _dt.date:
+    return _dt.date.fromisoformat(row[key])
+
+
+def _identity_source_rule(row: sqlite3.Row) -> dict:
+    return {
+        "source": row["source"],
+        "source_record": row["source_record"],
+        "announcement_id": row["announcement_id"],
+        "action": row["action"],
+        "received_at": _parse_dt(row["received_at"]),
+        "effective_from": _dt.date.fromisoformat(row["effective_from"]),
+        "effective_to": (
+            _dt.date.fromisoformat(row["effective_to"])
+            if row["effective_to"] else None
+        ),
+    }
 
 
 _DDL = """
@@ -88,6 +108,50 @@ CREATE TABLE IF NOT EXISTS priority_rule(
     reason TEXT NOT NULL DEFAULT '',
     supersedes TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS identity_announcement(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    announcement_id TEXT NOT NULL UNIQUE,
+    display_code TEXT NOT NULL,
+    market TEXT NOT NULL DEFAULT '',
+    security_id TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    effective_from TEXT NOT NULL,
+    effective_to TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    source_record TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    target_announcement_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_identity_code_asof
+    ON identity_announcement(display_code, market, effective_from, received_at, seq);
+CREATE TABLE IF NOT EXISTS code_quote_event(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    display_code TEXT NOT NULL,
+    market TEXT NOT NULL DEFAULT '',
+    business_date TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    open REAL, high REAL, low REAL, close REAL, volume REAL,
+    reason TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL,
+    source_record TEXT NOT NULL,
+    target_source TEXT NOT NULL DEFAULT '',
+    target_record TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL,
+    UNIQUE(display_code, market, business_date, source, source_record)
+);
+CREATE INDEX IF NOT EXISTS idx_code_quote_asof
+    ON code_quote_event(display_code, market, business_date, received_at, seq);
+CREATE TABLE IF NOT EXISTS saved_research(
+    research_id TEXT PRIMARY KEY,
+    saved_at TEXT NOT NULL,
+    business_date TEXT NOT NULL,
+    known_at TEXT NOT NULL,
+    identity_as_of TEXT NOT NULL DEFAULT '',
+    payload TEXT NOT NULL
+);
 """
 
 _EXTRA_COLUMNS = {
@@ -96,6 +160,18 @@ _EXTRA_COLUMNS = {
         "target_record": "TEXT NOT NULL DEFAULT ''",
     },
 }
+
+_DDL_V4_SECURITY_NO_UNIQUE = """
+CREATE TABLE security_new(
+    security_id TEXT PRIMARY KEY,
+    code TEXT NOT NULL,
+    name TEXT NOT NULL
+);
+INSERT INTO security_new(security_id, code, name)
+SELECT security_id, code, name FROM security;
+DROP TABLE security;
+ALTER TABLE security_new RENAME TO security;
+"""
 
 
 class Dataset:
@@ -121,6 +197,11 @@ class Dataset:
             for column, decl in columns.items():
                 if column not in existing:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        security_sql = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='security'"
+        ).fetchone()[0]
+        if "UNIQUE" in security_sql.upper():
+            self.conn.executescript(_DDL_V4_SECURITY_NO_UNIQUE)
         self.conn.commit()
 
     def set_source_priority(self, priority: dict[str, int]) -> None:
@@ -241,7 +322,7 @@ class Dataset:
 
     def add_security(self, security: Security) -> None:
         self.conn.execute(
-            "INSERT OR REPLACE INTO security(security_id, code, name) VALUES (?,?,?)",
+            "INSERT OR IGNORE INTO security(security_id, code, name) VALUES (?,?,?)",
             (security.security_id, security.code, security.name),
         )
         self.conn.commit()
@@ -251,6 +332,167 @@ class Dataset:
             "SELECT security_id, code, name FROM security ORDER BY security_id"
         )
         return [Security(*r) for r in rows]
+
+    # ---------- 证券身份公告（append-only，带业务有效期与收到时间） ----------
+
+    def add_identity_announcement(
+        self, announcement: IdentityAnnouncement
+    ) -> tuple[bool, int | None]:
+        """追加身份确认、候选、改名或撤回公告。
+
+        公告永不覆盖；撤回通过 target_announcement_id 精确指向旧公告。
+        """
+        aid = announcement.announcement_id or f"_auto_identity_{uuid.uuid4().hex}"
+        if announcement.announcement_id:
+            existing = self.conn.execute(
+                "SELECT seq FROM identity_announcement WHERE announcement_id=?",
+                (announcement.announcement_id,),
+            ).fetchone()
+            if existing is not None:
+                return False, existing["seq"]
+        if announcement.source and announcement.source_record:
+            existing = self.conn.execute(
+                "SELECT seq FROM identity_announcement WHERE source=? AND source_record=?",
+                (announcement.source, announcement.source_record),
+            ).fetchone()
+            if existing is not None:
+                return False, existing["seq"]
+        cur = self.conn.execute(
+            "INSERT INTO identity_announcement(announcement_id, display_code, market,"
+            " security_id, name, effective_from, effective_to, action, received_at,"
+            " source, source_record, reason, target_announcement_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                aid, announcement.display_code, announcement.market,
+                announcement.security_id, announcement.name,
+                announcement.effective_from.isoformat(),
+                announcement.effective_to.isoformat() if announcement.effective_to else "",
+                announcement.action, announcement.received_at.isoformat(),
+                announcement.source, announcement.source_record,
+                announcement.reason, announcement.target_announcement_id,
+            ),
+        )
+        self.conn.commit()
+        return True, cur.lastrowid
+
+    def identity_announcements(self) -> list[IdentityAnnouncement]:
+        rows = self.conn.execute(
+            "SELECT * FROM identity_announcement ORDER BY seq"
+        )
+        return [self._identity_from_row(r) for r in rows]
+
+    @staticmethod
+    def _identity_from_row(row: sqlite3.Row) -> IdentityAnnouncement:
+        return IdentityAnnouncement(
+            display_code=row["display_code"],
+            security_id=row["security_id"],
+            effective_from=_dt.date.fromisoformat(row["effective_from"]),
+            received_at=_parse_dt(row["received_at"]),
+            action=row["action"],
+            market=row["market"],
+            name=row["name"],
+            effective_to=(
+                _dt.date.fromisoformat(row["effective_to"])
+                if row["effective_to"] else None
+            ),
+            source=row["source"],
+            source_record=row["source_record"],
+            announcement_id=row["announcement_id"],
+            reason=row["reason"],
+            target_announcement_id=row["target_announcement_id"],
+        )
+
+    def identity_at(
+        self,
+        display_code: str,
+        business_date: str | _dt.date,
+        known_at: str | _dt.datetime,
+        market: str = "",
+    ) -> IdentityResolution:
+        """按业务日和公告收到时间解释显示代码，不使用迟到公告或撤回后的公告。"""
+        bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
+        ka = _parse_dt(known_at)
+        rows = list(self.conn.execute(
+            "SELECT * FROM identity_announcement"
+            " WHERE display_code=? AND market=? AND received_at <= ?"
+            " ORDER BY received_at, seq",
+            (display_code, market, ka.isoformat()),
+        ))
+        by_id = {r["announcement_id"]: r for r in rows}
+        withdrawn: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            if row["action"] == "withdraw":
+                target = row["target_announcement_id"]
+                if target in by_id:
+                    withdrawn[target] = row
+
+        effective = [
+            r for r in rows
+            if r["action"] in {"confirm", "rename", "candidate"}
+            and _date_from_row(r, "effective_from") <= bd
+            and (not r["effective_to"]
+                 or _dt.date.fromisoformat(r["effective_to"]) >= bd)
+            and r["announcement_id"] not in withdrawn
+        ]
+        removed = [
+            r for r in rows
+            if r["announcement_id"] in withdrawn
+            and _date_from_row(r, "effective_from") <= bd
+            and (not r["effective_to"]
+                 or _dt.date.fromisoformat(r["effective_to"]) >= bd)
+        ]
+
+        latest_by_security = {}
+        for row in effective:
+            latest_by_security[row["security_id"]] = row
+        relevant = sorted(
+            latest_by_security.values(),
+            key=lambda r: (r["received_at"], r["seq"]),
+            reverse=True,
+        )
+        confirms = [r for r in relevant if r["action"] in {"confirm", "rename"}]
+        candidates = [r for r in relevant if r["action"] == "candidate"]
+        active = [self._identity_from_row(r) for r in relevant]
+        removed_items = [self._identity_from_row(r) for r in removed]
+        withdrawal_items = [self._identity_from_row(withdrawn[r["announcement_id"]])
+                            for r in removed]
+
+        if len(confirms) == 1:
+            row = confirms[0]
+            status = "confirmed"
+            security_id = row["security_id"]
+            basis = "rename-announcement" if row["action"] == "rename" else "identity-announcement"
+        elif len(confirms) > 1:
+            status, security_id, row = "ambiguous", "", None
+            basis = "multiple-confirmed-identities"
+        elif candidates:
+            status, security_id, row = "candidate", "", None
+            basis = "insufficient-identity-information"
+        else:
+            status, security_id, row = "unknown", "", None
+            basis = "no-effective-identity-announcement"
+
+        source_rules = tuple(
+            _identity_source_rule(r)
+            for r in sorted(effective + removed,
+                            key=lambda x: (x["received_at"], x["seq"]))
+        )
+        return IdentityResolution(
+            display_code=display_code,
+            market=market,
+            business_date=bd,
+            known_at=ka,
+            status=status,
+            security_id=security_id,
+            name=row["name"] if row is not None else "",
+            candidate_security_ids=tuple(r["security_id"] for r in candidates),
+            announcement_ids=tuple(r["announcement_id"] for r in relevant),
+            withdrawn_announcement_ids=tuple(r["announcement_id"] for r in removed),
+            basis=basis,
+            announcements=tuple(active),
+            withdrawn_announcements=tuple(removed_items + withdrawal_items),
+            source_rules=source_rules,
+        )
 
     def add_split(self, split: Split) -> None:
         self.conn.execute(
@@ -350,8 +592,59 @@ class Dataset:
             n += int(inserted)
         return n
 
+    def add_code_event(self, event: CodeQuoteEvent) -> tuple[bool, int | None]:
+        """写入按显示代码收到的行情，绝不依据当前代码表自动猜测证券。"""
+        h = self._code_content_hash(event)
+        existing = self.conn.execute(
+            "SELECT seq, content_hash FROM code_quote_event"
+            " WHERE display_code=? AND market=? AND business_date=?"
+            " AND source=? AND source_record=?",
+            (
+                event.display_code, event.market,
+                event.business_date.isoformat(),
+                event.source, event.source_record,
+            ),
+        ).fetchone()
+        if existing is not None:
+            if existing["content_hash"] != h:
+                raise ValueError(
+                    f"来源记录 {event.source}/{event.source_record} 内容冲突，"
+                    f"({event.display_code}/{event.market}, {event.business_date}) "
+                    "已存在不同数据"
+                )
+            return False, existing["seq"]
+        o, hi, lo, c, v = _quote_to_tuple(event.quote)
+        cur = self.conn.execute(
+            "INSERT INTO code_quote_event(display_code, market, business_date,"
+            " received_at, kind, open, high, low, close, volume, reason, source,"
+            " source_record, target_source, target_record, content_hash)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                event.display_code, event.market, event.business_date.isoformat(),
+                event.received_at.isoformat(), event.kind, o, hi, lo, c, v,
+                event.reason, event.source, event.source_record,
+                event.target_source, event.target_record, h,
+            ),
+        )
+        self.conn.commit()
+        return True, cur.lastrowid
+
     @staticmethod
     def _content_hash(event: QuoteEvent) -> str:
+        payload = json.dumps(
+            {
+                "kind": event.kind,
+                "quote": dataclasses_as_dict(event.quote),
+                "reason": event.reason,
+                "target": [event.target_source, event.target_record],
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _code_content_hash(event: CodeQuoteEvent) -> str:
         payload = json.dumps(
             {
                 "kind": event.kind,
@@ -376,6 +669,33 @@ class Dataset:
             (security_id, business_date, known_at.isoformat()),
         ))
 
+    def _visible_code_events(
+        self,
+        display_code: str,
+        market: str,
+        business_date: str,
+        known_at: _dt.datetime,
+    ) -> list[sqlite3.Row]:
+        return list(self.conn.execute(
+            "SELECT * FROM code_quote_event"
+            " WHERE display_code=? AND market=? AND business_date=?"
+            " AND received_at <= ? ORDER BY received_at, seq",
+            (display_code, market, business_date, known_at.isoformat()),
+        ))
+
+    @staticmethod
+    def _route_code_rows(
+        rows: list[sqlite3.Row], security_id: str
+    ) -> list[sqlite3.Row]:
+        """把按代码收到的候选转换为裁决器内部使用的行，原行不复制不覆盖。"""
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["security_id"] = security_id
+            item["event_origin"] = "display_code"
+            out.append(item)
+        return out
+
     def _visible_adjudication(
         self, security_id: str, business_date: str, known_at: _dt.datetime
     ) -> sqlite3.Row | None:
@@ -393,6 +713,7 @@ class Dataset:
     def _resolve(
         self, security_id: str, bd: _dt.date, known_at: _dt.datetime,
         priority_known_at: _dt.datetime | None = None,
+        routed_code_rows: list[dict] | None = None,
     ) -> dict:
         """合并截至 known_at 可见的全部事件，输出候选与裁决结果。
 
@@ -403,7 +724,9 @@ class Dataset:
         """
         bd_s = bd.isoformat()
         priority, priority_rule_id = self._priority_at(priority_known_at or known_at)
-        rows = self._visible_events(security_id, bd_s, known_at)
+        direct_rows = [dict(r) for r in self._visible_events(security_id, bd_s, known_at)]
+        rows = direct_rows + (routed_code_rows or [])
+        rows.sort(key=lambda r: (r["received_at"], r["seq"]))
 
         withdrawn_by: dict[tuple[str, str], str] = {}
         status_events: list[sqlite3.Row] = []
@@ -495,6 +818,8 @@ class Dataset:
         business_date: str | _dt.date,
         known_at: str | _dt.datetime,
         priority_as_of: str | _dt.datetime | None = None,
+        identity: IdentityResolution | None = None,
+        routed_code_rows: list[dict] | None = None,
     ) -> QuoteView:
         """as-of 查询：在 known_at 时点，回看 business_date 当天可知的行情。
 
@@ -505,7 +830,20 @@ class Dataset:
         bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
         ka = _parse_dt(known_at)
         pa = _parse_dt(priority_as_of) if priority_as_of is not None else None
-        resolved = self._resolve(security_id, bd, ka, pa)
+        resolved = self._resolve(security_id, bd, ka, pa, routed_code_rows)
+        identity_fields = {
+            "display_code": identity.display_code if identity else "",
+            "market": identity.market if identity else "",
+            "identity_status": identity.status if identity else "",
+            "identity_announcement_ids": identity.announcement_ids if identity else (),
+            "identity_withdrawn_announcement_ids": (
+                identity.withdrawn_announcement_ids if identity else ()
+            ),
+            "identity_basis": identity.basis if identity else "",
+            "identity_candidates": identity.candidate_security_ids if identity else (),
+            "identity_source_rules": identity.source_rules if identity else (),
+            "identity_name": identity.name if identity else "",
+        }
         chosen = resolved["chosen"]
         status_events = resolved["status_events"]
 
@@ -513,19 +851,19 @@ class Dataset:
         if chosen is None and not status_events:
             if saw_records:
                 status = QuoteStatus.WITHDRAWN
-                return QuoteView(
+                return dataclasses.replace(QuoteView(
                     security_id, bd, ka, status, None, None, "", "", None, "withdrawal",
                     candidates=resolved["candidates"],
                     selection_basis=resolved["basis"],
-                )
+                ), **identity_fields)
             if self.calendar.is_session(bd):
                 status = QuoteStatus.MISSING
             else:
                 status = QuoteStatus.NON_SESSION
-            return QuoteView(
+            return dataclasses.replace(QuoteView(
                 security_id, bd, ka, status, None, None, "", "", None, "none",
                 candidates=resolved["candidates"],
-            )
+            ), **identity_fields)
 
         latest_status = (
             max(status_events, key=lambda r: (r["received_at"], r["seq"]))
@@ -557,7 +895,7 @@ class Dataset:
             factor = self._adjustment(security_id, bd, ka)
             adjusted = round(quote.close / factor, 6)
 
-        return QuoteView(
+        return dataclasses.replace(QuoteView(
             security_id=security_id,
             business_date=bd,
             known_at=ka,
@@ -580,6 +918,53 @@ class Dataset:
             ),
             selection_basis=resolved["basis"],
             priority_rule_id=resolved["priority_rule_id"],
+            **identity_fields
+        ))
+
+    def quote_for_code(
+        self,
+        display_code: str,
+        business_date: str | _dt.date,
+        known_at: str | _dt.datetime,
+        market: str = "",
+        identity_as_of: str | _dt.datetime | None = None,
+    ) -> QuoteView:
+        """查询显示代码行情，并说明采用的证券身份、公告与来源规则。
+
+        identity_as_of 用于身份映射调整前后对照；缺省时等于 known_at，
+        即公告迟到和撤回均按原研究视角解释。
+        """
+        bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
+        ka = _parse_dt(known_at)
+        ia = _parse_dt(identity_as_of) if identity_as_of is not None else ka
+        identity = self.identity_at(display_code, bd, ia, market)
+        routed = self._route_code_rows(
+            self._visible_code_events(display_code, market, bd.isoformat(), ka),
+            identity.security_id,
+        )
+        if identity.status != "confirmed":
+            status = {
+                "candidate": QuoteStatus.IDENTITY_CANDIDATE,
+                "unknown": QuoteStatus.IDENTITY_UNKNOWN,
+                "ambiguous": QuoteStatus.IDENTITY_AMBIGUOUS,
+            }[identity.status]
+            unresolved = self._resolve("", bd, ka, routed_code_rows=routed)
+            return QuoteView(
+                security_id="", business_date=bd, known_at=ka, status=status,
+                quote=None, adjusted_close=None, source="", source_record="",
+                received_at=None, event_kind="identity",
+                candidates=unresolved["candidates"],
+                display_code=display_code, market=market,
+                identity_status=identity.status,
+                identity_announcement_ids=identity.announcement_ids,
+                identity_withdrawn_announcement_ids=identity.withdrawn_announcement_ids,
+                identity_basis=identity.basis,
+                identity_candidates=identity.candidate_security_ids,
+                identity_source_rules=identity.source_rules,
+            )
+        return self.quote_at(
+            identity.security_id, bd, ka, identity=identity,
+            routed_code_rows=routed,
         )
 
     def series(
@@ -594,6 +979,247 @@ class Dataset:
         ka = _parse_dt(known_at)
         dates = self.calendar.sessions(start, end) if only_sessions else _enumerate_dates(start, end)
         return [self.quote_at(security_id, d, ka) for d in dates]
+
+    # ---------- 组合研究与身份映射调整对照 ----------
+
+    def evaluate_portfolio(
+        self,
+        holdings: list[dict],
+        business_date: str | _dt.date,
+        known_at: str | _dt.datetime,
+        identity_as_of: str | _dt.datetime | None = None,
+    ) -> dict:
+        """按某研究时点解释组合；同一稳定证券的多笔持仓只取一次行情。"""
+        bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
+        ka = _parse_dt(known_at)
+        ia = _parse_dt(identity_as_of) if identity_as_of is not None else ka
+        grouped: dict[str, dict] = {}
+        unresolved = []
+
+        for pos, holding in enumerate(holdings):
+            weight = float(holding.get("weight", 1.0))
+            label = holding.get("label", holding.get("display_code")
+                              or holding.get("security_id", str(pos)))
+            if holding.get("security_id"):
+                sid = holding["security_id"]
+                view = self.quote_at(sid, bd, ka)
+                entry = self._portfolio_entry(label, sid, weight, view, holding, pos)
+            else:
+                code = holding.get("display_code") or holding.get("code")
+                market = holding.get("market", "")
+                view = self.quote_for_code(code, bd, ka, market, ia)
+                entry = self._portfolio_entry(code or label, view.security_id,
+                                              weight, view, holding, pos,
+                                              market=market)
+                if view.identity_status != "confirmed":
+                    entry["resolved_security_id"] = ""
+                    unresolved.append(entry)
+                    continue
+                sid = view.security_id
+
+            if sid not in grouped:
+                entry["included"] = True
+                entry["weight"] = weight
+                grouped[sid] = entry
+            else:
+                grouped[sid]["weight"] += weight
+                grouped[sid]["duplicate_positions"].append({
+                    "position": pos,
+                    "label": label,
+                    "weight": weight,
+                })
+
+        positions = sorted(grouped.values(), key=lambda x: x["position"])
+        unresolved.sort(key=lambda x: x["position"])
+        value = sum(
+            p["weight"] * p["close"]
+            for p in positions
+            if p["close"] is not None
+        )
+        deployed_weight = sum(
+            p["weight"] for p in positions if p["close"] is not None
+        )
+        return {
+            "business_date": bd,
+            "known_at": ka,
+            "identity_as_of": ia,
+            "positions": positions,
+            "unresolved_positions": unresolved,
+            "portfolio_value": round(value, 6),
+            "deployed_weight": deployed_weight,
+            "security_ids": tuple(p["security_id"] for p in positions),
+        }
+
+    @staticmethod
+    def _portfolio_entry(label, sid, weight, view, holding, position,
+                         market="") -> dict:
+        return {
+            "position": position,
+            "label": label,
+            "display_code": getattr(view, "display_code", "") or holding.get("display_code", ""),
+            "market": market,
+            "security_id": sid,
+            "name": view.identity_name,
+            "weight": weight,
+            "close": view.quote.close if view.quote else None,
+            "adjusted_close": view.adjusted_close,
+            "status": view.status.value,
+            "identity_status": view.identity_status,
+            "identity_basis": view.identity_basis,
+            "announcement_ids": list(view.identity_announcement_ids),
+            "source": view.source,
+            "source_record": view.source_record,
+            "view": view,
+            "included": False,
+            "duplicate_positions": [],
+        }
+
+    def compare_identity_adjustment(
+        self,
+        holdings: list[dict],
+        business_date: str | _dt.date,
+        known_at: str | _dt.datetime,
+        revised_identity_as_of: str | _dt.datetime,
+        original_identity_as_of: str | _dt.datetime | None = None,
+        revised_known_at: str | _dt.datetime | None = None,
+    ) -> dict:
+        """对照身份映射调整前后，并归类价格、证券范围和名称变化。"""
+        ka = _parse_dt(known_at)
+        original_ia = _parse_dt(original_identity_as_of) if original_identity_as_of else ka
+        revised_ia = _parse_dt(revised_identity_as_of)
+        revised_ka = _parse_dt(revised_known_at) if revised_known_at else ka
+        original = self.evaluate_portfolio(holdings, business_date, ka, original_ia)
+        revised = self.evaluate_portfolio(holdings, business_date, revised_ka, revised_ia)
+
+        old_by_pos = {p["position"]: p for p in original["positions"]
+                      + original["unresolved_positions"]}
+        new_by_pos = {p["position"]: p for p in revised["positions"]
+                      + revised["unresolved_positions"]}
+        changes = []
+        for pos in sorted(set(old_by_pos) | set(new_by_pos)):
+            before, after = old_by_pos.get(pos), new_by_pos.get(pos)
+            kinds = self._classify_portfolio_change(before, after)
+            if kinds:
+                changes.append({
+                    "position": pos,
+                    "kinds": kinds,
+                    "before": self._comparable_position(before),
+                    "after": self._comparable_position(after),
+                })
+
+        old_ids = set(original["security_ids"])
+        new_ids = set(revised["security_ids"])
+        return {
+            "business_date": original["business_date"],
+            "original": original,
+            "revised": revised,
+            "changes": changes,
+            "added_security_ids": tuple(sorted(new_ids - old_ids)),
+            "removed_security_ids": tuple(sorted(old_ids - new_ids)),
+            "original_value": original["portfolio_value"],
+            "revised_value": revised["portfolio_value"],
+            "value_delta": round(
+                revised["portfolio_value"] - original["portfolio_value"], 6
+            ),
+        }
+
+    @staticmethod
+    def _classify_portfolio_change(before: dict | None, after: dict | None) -> list[str]:
+        kinds: list[str] = []
+        if before is None or after is None:
+            return ["security-scope-change"]
+        if (before.get("security_id") != after.get("security_id")
+                or before.get("identity_status") != after.get("identity_status")):
+            return ["security-scope-change"]
+        if before.get("close") != after.get("close"):
+            kinds.append("true-price-change")
+        if (before.get("announcement_ids") != after.get("announcement_ids")
+                or before.get("identity_basis") != after.get("identity_basis")):
+            kinds.append("name-only-change")
+        elif before.get("name") != after.get("name"):
+            kinds.append("name-only-change")
+        return kinds
+
+    @staticmethod
+    def _comparable_position(position: dict | None) -> dict | None:
+        if position is None:
+            return None
+        return {key: value for key, value in position.items() if key != "view"}
+
+    def save_portfolio_research(
+        self,
+        research_id: str,
+        holdings: list[dict],
+        business_date: str | _dt.date,
+        known_at: str | _dt.datetime,
+        saved_at: str | _dt.datetime,
+        identity_as_of: str | _dt.datetime | None = None,
+    ) -> dict:
+        """保存组合研究及其当时身份解释；后续公告不改写该研究。"""
+        result = self.evaluate_portfolio(holdings, business_date, known_at, identity_as_of)
+        payload = {
+            "research_id": research_id,
+            "holdings": holdings,
+            "result": self._json_safe(result),
+        }
+        self.conn.execute(
+            "INSERT INTO saved_research(research_id, saved_at,"
+            " business_date, known_at, identity_as_of, payload)"
+            " VALUES (?,?,?,?,?,?)",
+            (
+                research_id,
+                _parse_dt(saved_at).isoformat(),
+                result["business_date"].isoformat(),
+                result["known_at"].isoformat(),
+                result["identity_as_of"].isoformat(),
+                json.dumps(payload, ensure_ascii=False, default=_json_default),
+            ),
+        )
+        self.conn.commit()
+        return result
+
+    def saved_research(self, research_id: str) -> dict:
+        row = self.conn.execute(
+            "SELECT * FROM saved_research WHERE research_id=?", (research_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"未找到已保存研究: {research_id}")
+        payload = json.loads(row["payload"])
+        payload["saved_at"] = _parse_dt(row["saved_at"])
+        payload["business_date"] = _dt.date.fromisoformat(row["business_date"])
+        payload["known_at"] = _parse_dt(row["known_at"])
+        payload["identity_as_of"] = _parse_dt(row["identity_as_of"])
+        return payload
+
+    def reopen_saved_research(self, research_id: str) -> dict:
+        """按保存时的 known_at 与 identity_as_of 重新解释已保存研究。"""
+        saved = self.saved_research(research_id)
+        reopened = self.evaluate_portfolio(
+            saved["holdings"], saved["business_date"], saved["known_at"],
+            saved["identity_as_of"],
+        )
+        return {
+            "saved": saved,
+            "reopened": reopened,
+            "same_value": saved["result"]["portfolio_value"]
+            == reopened["portfolio_value"],
+            "same_security_ids": tuple(saved["result"]["security_ids"])
+            == reopened["security_ids"],
+        }
+
+    @classmethod
+    def _json_safe(cls, value):
+        if isinstance(value, dict):
+            return {k: cls._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._json_safe(v) for v in value]
+        if hasattr(value, "as_dict"):
+            return value.as_dict()
+        if isinstance(value, _dt.datetime):
+            return value.isoformat()
+        if isinstance(value, _dt.date):
+            return value.isoformat()
+        return value
 
     def received_log(
         self,
@@ -868,7 +1494,9 @@ class Dataset:
         """数据集指纹，保存后重开应保持一致。"""
         counts = {}
         for table in ("security", "trading_session", "corp_split",
-                      "quote_event", "adjudication", "priority_rule"):
+                      "quote_event", "adjudication", "priority_rule",
+                      "identity_announcement", "code_quote_event",
+                      "saved_research"):
             counts[table] = self.conn.execute(
                 f"SELECT COUNT(*) FROM {table}"
             ).fetchone()[0]
@@ -887,6 +1515,12 @@ def dataclasses_as_dict(obj) -> dict | None:
         return None
     import dataclasses
     return dataclasses.asdict(obj)
+
+
+def _json_default(obj):
+    if hasattr(obj, "isoformat"):
+        return obj.isoformat()
+    raise TypeError(f"不可 JSON 序列化的对象: {type(obj)!r}")
 
 
 def _enumerate_dates(start, end) -> list[_dt.date]:

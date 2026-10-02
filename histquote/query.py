@@ -41,6 +41,15 @@ class QuoteView:
     decision_reason: str = ""
     selection_basis: str = ""   # single-source / default-priority / adjudicated
     priority_rule_id: str = ""  # 本次裁决实际采用的优先级规则（空 = 内存默认配置）
+    display_code: str = ""
+    market: str = ""
+    identity_status: str = ""
+    identity_announcement_ids: tuple[str, ...] = ()
+    identity_withdrawn_announcement_ids: tuple[str, ...] = ()
+    identity_basis: str = ""
+    identity_candidates: tuple[str, ...] = ()
+    identity_source_rules: tuple[dict, ...] = ()
+    identity_name: str = ""
 
     def as_dict(self) -> dict:
         q = dataclasses.asdict(self.quote) if self.quote else None
@@ -64,4 +73,22 @@ class QuoteView:
             "decision_reason": self.decision_reason,
             "selection_basis": self.selection_basis,
             "priority_rule_id": self.priority_rule_id,
+            "display_code": self.display_code,
+            "market": self.market,
+            "identity_status": self.identity_status,
+            "identity_announcement_ids": list(self.identity_announcement_ids),
+            "identity_withdrawn_announcement_ids": list(
+                self.identity_withdrawn_announcement_ids),
+            "identity_basis": self.identity_basis,
+            "identity_candidates": list(self.identity_candidates),
+            "identity_name": self.identity_name,
+            "identity_source_rules": [
+                dict(r, received_at=(r["received_at"].isoformat()
+                                     if r.get("received_at") else None),
+                     effective_from=(r["effective_from"].isoformat()
+                                     if r.get("effective_from") else None),
+                     effective_to=(r["effective_to"].isoformat()
+                                   if r.get("effective_to") else None))
+                for r in self.identity_source_rules
+            ],
         }

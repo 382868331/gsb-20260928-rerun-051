@@ -5,6 +5,9 @@
 >
 > 第三轮新增：**来源优先级规则的历史有效范围**与**规则调整前后的研究对照**
 > （`examples/demo_priority_rules.py`，`tests/test_priority_rules.py`）。
+>
+> 第四轮新增：**证券身份公告、显示代码复用/跨市场转板、映射撤回、组合身份调整对照**
+> （`examples/demo_identity.py`，`tests/test_identity_portfolio.py`）。
 
 纯 Python 标准库 + SQLite，离线运行，不联网下载任何行情。核心解决一个问题：
 **回测站在某个历史时点，只能看到当时实际已经收到的数据；后来补齐的价格、迟到的修订、事后才公告的拆分因子都不能被提前使用。**
@@ -21,12 +24,15 @@
 ## 模块
 
 - `histquote/identity.py`：证券身份 `Security`；拆分 `Split`（除权日 + 因子 + 收到时间）。
+- `histquote/identity.py`：`IdentityAnnouncement`（确认/候选/改名/撤回）与
+  `IdentityResolution`（查询采用的身份、公告和来源规则）。
 - `histquote/calendar.py`：交易日历，区分开市日与非交易日。
-- `histquote/quote.py`：`Quote`、`QuoteEvent`、`QuoteStatus`。
+- `histquote/quote.py`：`Quote`、稳定证券事件 `QuoteEvent`、显示代码事件
+  `CodeQuoteEvent`、`QuoteStatus`。
 - `histquote/dataset.py`：SQLite 存储、事件写入、as-of 合并查询、保存/重开、数据指纹。
 - `histquote/query.py`：查询结果 `QuoteView`（含状态、复权收盘、来源、来源记录号）。
 - `examples/demo.py`：虚构样例演示。
-- `tests/test_bitemporal.py`：9 个语义测试。
+- `tests/test_bitemporal.py`：基础双时态语义测试。
 
 ## 状态语义（回测必须区分）
 
@@ -91,12 +97,40 @@
   拆分公告与优先级规则修订，各自何时可见一目了然。
 - `QuoteView.priority_rule_id` 标明本次裁决实际采用的规则。
 
+## 证券身份、代码复用与跨市场转板
+
+- 稳定键始终是 `security_id`；显示代码、市场和名称只作为带业务有效期的公告事实。
+- `add_identity_announcement()` 只追加 `confirm` / `candidate` / `rename` /
+  `withdraw` 公告；`withdraw` 精确引用旧公告 ID，不删除原公告。
+- `quote_for_code(code, business_date, known_at, market=...)` 同时按业务日期和
+  收到时间解释身份：迟到公告不能提前使用，映射撤回后旧视角仍能复算。
+- 资料不足返回 `identity_candidate`，没有公告返回 `identity_unknown`，多份确认冲突
+  返回 `identity_ambiguous`；这些状态下报价只保留为候选，不会自动接到任何证券上。
+- `CodeQuoteEvent` 保存按外部代码收到的原报价；只有唯一 `confirm/rename` 身份
+  才路由到对应 `security_id`，旧代码迟到报价不会和新证券价格接成一条历史。
+- `QuoteView` 会返回采用的 `security_id`、名称、公告 ID、撤回公告 ID、候选身份和
+  来源规则；原代码报价记录始终保留。
+
+## 组合研究与身份调整对照
+
+- `evaluate_portfolio()` 按显示代码或稳定 ID 解释持仓；同一 `security_id` 的多笔
+  新旧持仓只裁决和纳入一次行情，重复持仓会在 `duplicate_positions` 中说明，
+  权重仍可聚合。
+- `compare_identity_adjustment()` 固定行情可见时点或另给修订后视角，对照身份映射
+  调整前后：
+  - `true-price-change`：同一稳定证券的价格或来源记录变化；
+  - `security-scope-change`：证券身份新增、移除或指向变化；
+  - `name-only-change`：稳定证券不变，仅改名公告/身份解释变化。
+- `save_portfolio_research()` 保存持仓、研究时点、`identity_as_of` 和当时结果；
+  后续代码重分配、公告迟到或撤回后，`reopen_saved_research()` 仍按当时身份解释。
+
 ## 快速开始
 
 ```bash
 .venv/bin/python -m examples.demo
 .venv/bin/python -m examples.demo_conflict
 .venv/bin/python -m examples.demo_priority_rules
+.venv/bin/python -m examples.demo_identity
 .venv/bin/python -m unittest discover -s tests
 ```
 
