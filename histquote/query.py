@@ -19,6 +19,8 @@ class SourceCandidate:
     close: float | None
     active: bool          # 截至 known_at 是否未被该来源撤回
     withdrawn_by: str     # 撤回它的来源记录号（未撤回为 ""）
+    security_id: str = ""
+    reported_code: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -41,6 +43,12 @@ class QuoteView:
     decision_reason: str = ""
     selection_basis: str = ""   # single-source / default-priority / adjudicated
     priority_rule_id: str = ""  # 本次裁决实际采用的优先级规则（空 = 内存默认配置）
+    queried_code: str = ""
+    identity_status: str = ""   # confirmed / ambiguous / unmapped / direct
+    identity_announcement_ids: tuple[str, ...] = ()
+    identity_candidates: tuple[str, ...] = ()
+    identity_name: str = ""
+    identity_source_rule: str = ""
 
     def as_dict(self) -> dict:
         q = dataclasses.asdict(self.quote) if self.quote else None
@@ -64,4 +72,10 @@ class QuoteView:
             "decision_reason": self.decision_reason,
             "selection_basis": self.selection_basis,
             "priority_rule_id": self.priority_rule_id,
+            "queried_code": self.queried_code,
+            "identity_status": self.identity_status,
+            "identity_announcement_ids": list(self.identity_announcement_ids),
+            "identity_candidates": list(self.identity_candidates),
+            "identity_name": self.identity_name,
+            "identity_source_rule": self.identity_source_rule,
         }

@@ -8,6 +8,7 @@ as-of 查询只取 received_at <= known_at 的最后一条有效事件。
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime as _dt
 import hashlib
 import json
@@ -19,11 +20,12 @@ from pathlib import Path
 from .calendar import TradingCalendar
 from .adjudication import Adjudication
 from .identity import Security, Split
+from .identity import IdentityAnnouncement, PortfolioPosition
 from .priority import PriorityRule
 from .query import QuoteView, SourceCandidate
 from .quote import Quote, QuoteEvent, QuoteStatus
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _parse_dt(value: str | _dt.datetime) -> _dt.datetime:
@@ -36,11 +38,16 @@ def _quote_to_tuple(q: Quote | None) -> tuple:
     return (q.open, q.high, q.low, q.close, q.volume)
 
 
+def identity_security_id(view: QuoteView) -> str:
+    return view.security_id or (view.identity_candidates[0]
+                                if len(view.identity_candidates) == 1 else "")
+
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS security(
     security_id TEXT PRIMARY KEY,
-    code TEXT NOT NULL UNIQUE,
+    code TEXT NOT NULL,
     name TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS trading_session(session_date TEXT PRIMARY KEY);
@@ -61,6 +68,7 @@ CREATE TABLE IF NOT EXISTS quote_event(
     reason TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL,
     source_record TEXT NOT NULL,
+    reported_code TEXT NOT NULL DEFAULT '',
     target_source TEXT NOT NULL DEFAULT '',
     target_record TEXT NOT NULL DEFAULT '',
     content_hash TEXT NOT NULL,
@@ -88,12 +96,29 @@ CREATE TABLE IF NOT EXISTS priority_rule(
     reason TEXT NOT NULL DEFAULT '',
     supersedes TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS identity_announcement(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    announcement_id TEXT NOT NULL UNIQUE,
+    code TEXT NOT NULL,
+    security_id TEXT NOT NULL,
+    effective_date TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    action TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    source_record TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    supersedes TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_identity_code
+    ON identity_announcement(code, effective_date, received_at, seq);
 """
 
 _EXTRA_COLUMNS = {
     "quote_event": {
         "target_source": "TEXT NOT NULL DEFAULT ''",
         "target_record": "TEXT NOT NULL DEFAULT ''",
+        "reported_code": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -114,6 +139,17 @@ class Dataset:
 
     def _migrate(self) -> None:
         """为旧库补齐新增列，保证首轮快照可直接重开。"""
+        indexes = {r[1] for r in self.conn.execute("PRAGMA index_list(security)")}
+        if "sqlite_autoindex_security_1" in indexes:
+            self.conn.executescript(
+                "CREATE TABLE security_new("
+                "security_id TEXT PRIMARY KEY, code TEXT NOT NULL,"
+                " name TEXT NOT NULL);"
+                "INSERT INTO security_new(security_id, code, name)"
+                " SELECT security_id, code, name FROM security;"
+                "DROP TABLE security;"
+                "ALTER TABLE security_new RENAME TO security;"
+            )
         for table, columns in _EXTRA_COLUMNS.items():
             existing = {
                 r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")
@@ -265,6 +301,168 @@ class Dataset:
         )
         self.conn.commit()
 
+    # ---------- 身份公告（append-only，带历史有效范围） ----------
+
+    def add_identity_announcement(
+        self, announcement: IdentityAnnouncement
+    ) -> tuple[bool, int | None]:
+        if announcement.announcement_id:
+            existing = self.conn.execute(
+                "SELECT seq FROM identity_announcement WHERE announcement_id=?",
+                (announcement.announcement_id,),
+            ).fetchone()
+            if existing is not None:
+                return False, existing["seq"]
+        cur = self.conn.execute(
+            "INSERT INTO identity_announcement(announcement_id, code, security_id,"
+            " effective_date, received_at, action, name, source, source_record,"
+            " reason, supersedes) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                announcement.announcement_id,
+                announcement.code,
+                announcement.security_id,
+                announcement.effective_date.isoformat(),
+                announcement.received_at.isoformat(),
+                announcement.action,
+                announcement.name,
+                announcement.source,
+                announcement.source_record,
+                announcement.reason,
+                announcement.supersedes,
+            ),
+        )
+        self.conn.commit()
+        return True, cur.lastrowid
+
+    def identity_announcements(
+        self, code: str | None = None, known_at: str | _dt.datetime | None = None
+    ) -> list[IdentityAnnouncement]:
+        return [self._identity_from_row(r) for r in
+                self._identity_rows(code, known_at)]
+
+    def _identity_rows(
+        self, code: str | None = None, known_at: str | _dt.datetime | None = None
+    ) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM identity_announcement"
+        cond, params = [], []
+        if code is not None:
+            cond.append("code=?")
+            params.append(code)
+        if known_at is not None:
+            cond.append("received_at <= ?")
+            params.append(_parse_dt(known_at).isoformat())
+        if cond:
+            sql += " WHERE " + " AND ".join(cond)
+        sql += " ORDER BY received_at, seq"
+        return list(self.conn.execute(sql, params))
+
+    @staticmethod
+    def _identity_from_row(r: sqlite3.Row) -> IdentityAnnouncement:
+        return IdentityAnnouncement(
+            r["announcement_id"], r["code"], r["security_id"],
+            _dt.date.fromisoformat(r["effective_date"]),
+            _parse_dt(r["received_at"]), r["action"], r["name"],
+            r["source"], r["source_record"], r["reason"], r["supersedes"],
+        )
+
+    def resolve_code(
+        self,
+        code: str,
+        business_date: str | _dt.date,
+        known_at: str | _dt.datetime,
+    ) -> dict:
+        bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
+        ka = _parse_dt(known_at)
+        rows = [
+            r for r in self._identity_rows(code, ka)
+            if _dt.date.fromisoformat(r["effective_date"]) <= bd
+        ]
+        withdrawn = {
+            r["supersedes"]
+            for r in rows
+            if r["action"] == "withdraw" and r["supersedes"]
+        }
+        superseded_at = {}
+        for r in rows:
+            if (r["action"] == "confirm" and r["supersedes"]
+                    and r["announcement_id"] not in withdrawn):
+                prior_date = _dt.date.fromisoformat(r["effective_date"])
+                old_at = superseded_at.get(r["supersedes"])
+                if old_at is None or prior_date < old_at:
+                    superseded_at[r["supersedes"]] = prior_date
+        latest_by_sid: dict[str, sqlite3.Row] = {}
+        for r in rows:
+            if r["action"] != "confirm" or r["announcement_id"] in withdrawn:
+                continue
+            end = superseded_at.get(r["announcement_id"])
+            if end is not None and bd >= end:
+                continue
+            sid = r["security_id"]
+            old = latest_by_sid.get(sid)
+            if old is None or (r["received_at"], r["seq"]) > (old["received_at"], old["seq"]):
+                latest_by_sid[sid] = r
+        candidates = tuple(sorted(latest_by_sid))
+        active = [latest_by_sid[sid] for sid in candidates]
+        if len(candidates) == 1:
+            row = active[0]
+            return {
+                "status": "confirmed",
+                "code": code,
+                "security_id": candidates[0],
+                "candidates": candidates,
+                "announcement_ids": (row["announcement_id"],),
+                "name": row["name"],
+                "source_rule": f"identity-announcement:{row['source']}/{row['source_record']}",
+            }
+        if len(candidates) > 1:
+            return {
+                "status": "ambiguous", "code": code, "security_id": "",
+                "candidates": candidates,
+                "announcement_ids": tuple(r["announcement_id"] for r in active),
+                "name": "", "source_rule": "multiple-identity-announcements",
+            }
+        master = self.conn.execute(
+            "SELECT * FROM security WHERE code=? ORDER BY security_id", (code,)
+        ).fetchall()
+        if not latest_by_sid:
+            observed = self.conn.execute(
+                "SELECT DISTINCT security_id FROM quote_event"
+                " WHERE reported_code=? AND received_at <= ? ORDER BY security_id",
+                (code, ka.isoformat()),
+            ).fetchall()
+            observed_sids = tuple(r["security_id"] for r in observed)
+            if len(master) == 1 and (
+                not observed_sids or observed_sids == (master[0]["security_id"],)
+            ):
+                return {
+                    "status": "direct", "code": code,
+                    "security_id": master[0]["security_id"],
+                    "candidates": (master[0]["security_id"],),
+                    "announcement_ids": (), "name": master[0]["name"],
+                    "source_rule": "security-master-code",
+                }
+            if observed:
+                return {
+                    "status": "ambiguous", "code": code, "security_id": "",
+                    "candidates": observed_sids,
+                    "announcement_ids": (), "name": "",
+                    "source_rule": "reported-code-awaits-identity-announcement",
+                }
+        if len(master) == 1:
+            return {
+                "status": "direct", "code": code,
+                "security_id": master[0]["security_id"],
+                "candidates": (master[0]["security_id"],),
+                "announcement_ids": (), "name": master[0]["name"],
+                "source_rule": "security-master-code",
+            }
+        return {
+            "status": "ambiguous" if master else "unmapped", "code": code,
+            "security_id": "", "candidates": tuple(r["security_id"] for r in master),
+            "announcement_ids": (), "name": "",
+            "source_rule": "insufficient-identity-information",
+        }
+
     # ---------- 行情写入 ----------
 
     def add_event(self, event: QuoteEvent) -> tuple[bool, int | None]:
@@ -295,8 +493,8 @@ class Dataset:
         cur = self.conn.execute(
             "INSERT INTO quote_event(security_id, business_date, received_at, kind,"
             " open, high, low, close, volume, reason, source, source_record,"
-            " target_source, target_record, content_hash)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " reported_code, target_source, target_record, content_hash)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 event.security_id,
                 event.business_date.isoformat(),
@@ -306,6 +504,7 @@ class Dataset:
                 event.reason,
                 event.source,
                 event.source_record,
+                event.reported_code,
                 event.target_source,
                 event.target_record,
                 h,
@@ -358,6 +557,7 @@ class Dataset:
                 "quote": dataclasses_as_dict(event.quote),
                 "reason": event.reason,
                 "target": [event.target_source, event.target_record],
+                "reported_code": event.reported_code,
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -367,13 +567,32 @@ class Dataset:
     # ---------- 双时态查询 ----------
 
     def _visible_events(
-        self, security_id: str, business_date: str, known_at: _dt.datetime
+        self, security_id: str, business_date: str, known_at: _dt.datetime,
+        reported_code: str | None = None,
     ) -> list[sqlite3.Row]:
-        return list(self.conn.execute(
+        sql = (
             "SELECT * FROM quote_event"
             " WHERE security_id=? AND business_date=? AND received_at <= ?"
+        )
+        params: list = [security_id, business_date, known_at.isoformat()]
+        if reported_code is not None:
+            sql += " AND (reported_code=? OR reported_code='')"
+            params.append(reported_code)
+        sql += " ORDER BY received_at, seq"
+        return list(self.conn.execute(sql, params))
+
+    def _visible_code_events(
+        self, code: str, security_ids: tuple[str, ...],
+        business_date: str, known_at: _dt.datetime,
+    ) -> list[sqlite3.Row]:
+        sids = tuple(dict.fromkeys((*security_ids, "")))
+        placeholders = ",".join("?" for _ in sids)
+        return list(self.conn.execute(
+            f"SELECT * FROM quote_event WHERE security_id IN ({placeholders})"
+            " AND business_date=? AND received_at <= ?"
+            " AND (reported_code=? OR reported_code='')"
             " ORDER BY received_at, seq",
-            (security_id, business_date, known_at.isoformat()),
+            (*sids, business_date, known_at.isoformat(), code),
         ))
 
     def _visible_adjudication(
@@ -393,6 +612,7 @@ class Dataset:
     def _resolve(
         self, security_id: str, bd: _dt.date, known_at: _dt.datetime,
         priority_known_at: _dt.datetime | None = None,
+        reported_code: str | None = None,
     ) -> dict:
         """合并截至 known_at 可见的全部事件，输出候选与裁决结果。
 
@@ -403,7 +623,7 @@ class Dataset:
         """
         bd_s = bd.isoformat()
         priority, priority_rule_id = self._priority_at(priority_known_at or known_at)
-        rows = self._visible_events(security_id, bd_s, known_at)
+        rows = self._visible_events(security_id, bd_s, known_at, reported_code)
 
         withdrawn_by: dict[tuple[str, str], str] = {}
         status_events: list[sqlite3.Row] = []
@@ -426,6 +646,8 @@ class Dataset:
                 kind=r["kind"],
                 received_at=_parse_dt(r["received_at"]),
                 close=r["close"],
+                security_id=r["security_id"],
+                reported_code=r["reported_code"],
                 active=self._row_key(r) not in withdrawn_by,
                 withdrawn_by=withdrawn_by.get(self._row_key(r), ""),
             )
@@ -495,6 +717,8 @@ class Dataset:
         business_date: str | _dt.date,
         known_at: str | _dt.datetime,
         priority_as_of: str | _dt.datetime | None = None,
+        reported_code: str | None = None,
+        identity_context: dict | None = None,
     ) -> QuoteView:
         """as-of 查询：在 known_at 时点，回看 business_date 当天可知的行情。
 
@@ -505,7 +729,7 @@ class Dataset:
         bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
         ka = _parse_dt(known_at)
         pa = _parse_dt(priority_as_of) if priority_as_of is not None else None
-        resolved = self._resolve(security_id, bd, ka, pa)
+        resolved = self._resolve(security_id, bd, ka, pa, reported_code)
         chosen = resolved["chosen"]
         status_events = resolved["status_events"]
 
@@ -517,6 +741,8 @@ class Dataset:
                     security_id, bd, ka, status, None, None, "", "", None, "withdrawal",
                     candidates=resolved["candidates"],
                     selection_basis=resolved["basis"],
+                    queried_code=reported_code or "",
+                    **self._identity_view_fields(identity_context),
                 )
             if self.calendar.is_session(bd):
                 status = QuoteStatus.MISSING
@@ -525,6 +751,8 @@ class Dataset:
             return QuoteView(
                 security_id, bd, ka, status, None, None, "", "", None, "none",
                 candidates=resolved["candidates"],
+                queried_code=reported_code or "",
+                **self._identity_view_fields(identity_context),
             )
 
         latest_status = (
@@ -580,6 +808,96 @@ class Dataset:
             ),
             selection_basis=resolved["basis"],
             priority_rule_id=resolved["priority_rule_id"],
+            queried_code=reported_code or "",
+            **self._identity_view_fields(identity_context),
+        )
+
+    @staticmethod
+    def _identity_view_fields(context: dict | None) -> dict:
+        if not context:
+            return {}
+        return {
+            "identity_status": context.get("status", ""),
+            "identity_announcement_ids": context.get("announcement_ids", ()),
+            "identity_candidates": context.get("candidates", ()),
+            "identity_name": context.get("name", ""),
+            "identity_source_rule": context.get("source_rule", ""),
+        }
+
+    def quote_by_code(
+        self,
+        code: str,
+        business_date: str | _dt.date,
+        known_at: str | _dt.datetime,
+        priority_as_of: str | _dt.datetime | None = None,
+        identity_as_of: str | _dt.datetime | None = None,
+    ) -> QuoteView:
+        bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
+        ka = _parse_dt(known_at)
+        identity = self.resolve_code(
+            code, bd, _parse_dt(identity_as_of) if identity_as_of is not None else ka)
+        status_value = identity["status"]
+        if status_value in {"confirmed", "direct"}:
+            view = self.quote_at(
+                identity["security_id"], bd, ka, priority_as_of,
+                reported_code=code, identity_context=identity,
+            )
+            all_rows = self._visible_code_events(
+                code, (identity["security_id"],), bd.isoformat(), ka
+            )
+            withdrawn = {
+                (r["target_source"], r["target_record"]): r["source_record"]
+                for r in all_rows if r["kind"] == "withdrawal"
+            }
+            raw_rows = [r for r in all_rows
+                        if r["kind"] not in {"withdrawal", "suspension", "cancel"}]
+            extra = tuple(
+                SourceCandidate(
+                    source=r["source"], source_record=r["source_record"], kind=r["kind"],
+                    received_at=_parse_dt(r["received_at"]), close=r["close"],
+                    active=False if r["security_id"] != identity["security_id"]
+                    else (r["source"], r["source_record"]) not in withdrawn,
+                    withdrawn_by=withdrawn.get((r["source"], r["source_record"]), ""),
+                    security_id=r["security_id"], reported_code=r["reported_code"],
+                )
+                for r in raw_rows
+            )
+            known_keys = {
+                (c.source, c.source_record) for c in view.candidates
+            }
+            merged = tuple(view.candidates) + tuple(
+                c for c in extra if (c.source, c.source_record) not in known_keys
+            )
+            return dataclasses.replace(view, candidates=merged)
+
+        rows = self._visible_code_events(code, identity["candidates"], bd.isoformat(), ka)
+        withdrawn = {
+            (r["target_source"], r["target_record"]): r["source_record"]
+            for r in rows if r["kind"] == "withdrawal"
+        }
+        quote_rows = [r for r in rows if r["kind"] not in {"withdrawal", "suspension", "cancel"}]
+        candidates = tuple(
+            SourceCandidate(
+                source=r["source"], source_record=r["source_record"], kind=r["kind"],
+                received_at=_parse_dt(r["received_at"]), close=r["close"],
+                active=(r["source"], r["source_record"]) not in withdrawn,
+                withdrawn_by=withdrawn.get((r["source"], r["source_record"]), ""),
+                security_id=r["security_id"], reported_code=r["reported_code"],
+            )
+            for r in quote_rows
+        )
+        saw_identity = bool(identity["candidates"])
+        status = QuoteStatus.AMBIGUOUS if (saw_identity or candidates) else QuoteStatus.MISSING
+        if not candidates and not saw_identity and not self.calendar.is_session(bd):
+            status = QuoteStatus.NON_SESSION
+        return QuoteView(
+            "", bd, ka, status, None, None, "", "", None, "identity",
+            candidates=candidates, selection_basis="identity-retained",
+            queried_code=code,
+            identity_status=status_value,
+            identity_announcement_ids=identity["announcement_ids"],
+            identity_candidates=identity["candidates"],
+            identity_source_rule=identity["source_rule"],
         )
 
     def series(
@@ -594,6 +912,171 @@ class Dataset:
         ka = _parse_dt(known_at)
         dates = self.calendar.sessions(start, end) if only_sessions else _enumerate_dates(start, end)
         return [self.quote_at(security_id, d, ka) for d in dates]
+
+    # ---------- 组合研究：身份解析、去重与调整对照 ----------
+
+    @staticmethod
+    def _position(position) -> PortfolioPosition:
+        if isinstance(position, PortfolioPosition):
+            return position
+        if isinstance(position, str):
+            return PortfolioPosition(position)
+        if isinstance(position, dict):
+            return PortfolioPosition(
+                position["code"],
+                position.get("security_id", ""),
+                position.get("quantity", 1.0),
+            )
+        code, security_id, quantity = position
+        return PortfolioPosition(code, security_id or "", quantity or 1.0)
+
+    def research_portfolio(
+        self,
+        positions,
+        business_date: str | _dt.date,
+        known_at: str | _dt.datetime,
+        identity_as_of: str | _dt.datetime | None = None,
+    ) -> dict:
+        bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
+        ka = _parse_dt(known_at)
+        ia = _parse_dt(identity_as_of) if identity_as_of is not None else ka
+        included: dict[str, dict] = {}
+        excluded = []
+        unresolved = []
+        for raw_position in positions:
+            pos = self._position(raw_position)
+            if pos.security_id:
+                identity = {
+                    "status": "direct", "code": pos.code,
+                    "security_id": pos.security_id,
+                    "candidates": (pos.security_id,), "announcement_ids": (),
+                    "name": self._security_name(pos.security_id),
+                    "source_rule": "portfolio-supplied-security-id",
+                }
+                name_rows = [
+                    r for r in self.conn.execute(
+                        "SELECT * FROM identity_announcement WHERE security_id=?"
+                        " AND effective_date <= ? AND received_at <= ?"
+                        " ORDER BY received_at, seq",
+                        (pos.security_id, bd.isoformat(), ia.isoformat()),
+                    )
+                ]
+                withdrawn_ids = {
+                    r["supersedes"] for r in name_rows
+                    if r["action"] == "withdraw"
+                }
+                active_names = [
+                    r for r in name_rows
+                    if r["action"] == "confirm" and r["announcement_id"] not in withdrawn_ids
+                ]
+                name_row = active_names[-1] if active_names else None
+                if name_row is not None:
+                    identity["name"] = name_row["name"]
+                    identity["announcement_ids"] = (name_row["announcement_id"],)
+                    identity["source_rule"] = (
+                        f"identity-announcement:{name_row['source']}/"
+                        f"{name_row['source_record']}"
+                    )
+                view = self.quote_at(
+                    pos.security_id, bd, ka, reported_code=None,
+                    identity_context=identity,
+                )
+            else:
+                view = self.quote_by_code(pos.code, bd, ka, identity_as_of=ia)
+            entry = {
+                "code": pos.code,
+                "security_id": view.security_id or identity_security_id(view),
+                "quantity": pos.quantity,
+                "view": view,
+                "name": view.identity_name or self._security_name(
+                    view.security_id or identity_security_id(view)
+                ),
+                "source_rule": view.identity_source_rule,
+                "announcement_ids": list(view.identity_announcement_ids),
+            }
+            if view.status == QuoteStatus.OK and entry["security_id"]:
+                prior = included.get(entry["security_id"])
+                if prior is None:
+                    included[entry["security_id"]] = entry
+                else:
+                    prior["quantity"] += pos.quantity
+                    prior["duplicate_codes"] = sorted(
+                        set(prior.get("duplicate_codes", [prior["code"]])) | {pos.code}
+                    )
+            elif view.status == QuoteStatus.AMBIGUOUS:
+                unresolved.append(entry)
+            else:
+                excluded.append(entry)
+        rows = list(included.values())
+        return {
+            "business_date": bd,
+            "known_at": ka,
+            "identity_as_of": ia,
+            "positions": tuple(rows),
+            "unresolved": tuple(unresolved),
+            "excluded": tuple(excluded),
+            "security_ids": tuple(r["security_id"] for r in rows),
+            "total_close_value": round(sum(
+                r["quantity"] * r["view"].quote.close
+                for r in rows if r["view"].quote and r["view"].quote.close is not None
+            ), 6),
+        }
+
+    def _security_name(self, security_id: str) -> str:
+        if not security_id:
+            return ""
+        row = self.conn.execute(
+            "SELECT name FROM security WHERE security_id=?", (security_id,)
+        ).fetchone()
+        return row[0] if row else ""
+
+    def compare_identity_adjustment(
+        self,
+        positions,
+        business_date: str | _dt.date,
+        known_at: str | _dt.datetime,
+        revised_identity_as_of: str | _dt.datetime,
+        revised_known_at: str | _dt.datetime | None = None,
+    ) -> dict:
+        original = self.research_portfolio(positions, business_date, known_at)
+        revised = self.research_portfolio(
+            positions, business_date,
+            revised_known_at if revised_known_at is not None else known_at,
+            identity_as_of=revised_identity_as_of,
+        )
+        before = {r["security_id"]: r for r in original["positions"]}
+        after = {r["security_id"]: r for r in revised["positions"]}
+        price_changes, name_changes, scope_changes = [], [], []
+        for sid in sorted(set(before) & set(after)):
+            old_close = before[sid]["view"].quote.close
+            new_close = after[sid]["view"].quote.close
+            if old_close != new_close:
+                price_changes.append({
+                    "security_id": sid, "before_close": old_close,
+                    "after_close": new_close,
+                    "change_type": "true-price-change",
+                })
+            elif before[sid]["name"] != after[sid]["name"]:
+                name_changes.append({
+                    "security_id": sid,
+                    "before_name": before[sid]["name"],
+                    "after_name": after[sid]["name"],
+                    "change_type": "name-only",
+                })
+        for sid in sorted(set(after) - set(before)):
+            scope_changes.append({"security_id": sid, "change": "added",
+                                  "change_type": "security-range-change"})
+        for sid in sorted(set(before) - set(after)):
+            scope_changes.append({"security_id": sid, "change": "removed",
+                                  "change_type": "security-range-change"})
+        return {
+            "business_date": original["business_date"],
+            "original": original,
+            "revised": revised,
+            "price_changes": tuple(price_changes),
+            "security_range_changes": tuple(scope_changes),
+            "name_only_changes": tuple(name_changes),
+        }
 
     def received_log(
         self,
@@ -641,6 +1124,11 @@ class Dataset:
             "selection_basis": view.selection_basis,
             "adjudication_id": view.adjudication_id,
             "priority_rule_id": view.priority_rule_id,
+            "identity_status": view.identity_status,
+            "identity_announcement_ids": view.identity_announcement_ids,
+            "identity_candidates": view.identity_candidates,
+            "identity_name": view.identity_name,
+            "identity_source_rule": view.identity_source_rule,
             "active_records": tuple(
                 (c.source, c.source_record) for c in view.candidates if c.active
             ),
@@ -700,6 +1188,28 @@ class Dataset:
                 "ratio": r["ratio"],
                 "received_at": _parse_dt(r["received_at"]),
                 "source": "", "source_record": "",
+            })
+        identity_rows = list(self.conn.execute(
+            "SELECT * FROM identity_announcement"
+            " WHERE (security_id=? OR security_id IN ("
+            " SELECT DISTINCT security_id FROM quote_event WHERE reported_code IN ("
+            " SELECT code FROM identity_announcement WHERE security_id=?)))"
+            " AND received_at > ? AND received_at <= ? ORDER BY received_at, seq",
+            (security_id, security_id, s.isoformat(), e.isoformat()),
+        ))
+        seen_identity = set()
+        for r in identity_rows:
+            if r["announcement_id"] in seen_identity:
+                continue
+            seen_identity.add(r["announcement_id"])
+            events.append({
+                "type": "identity_announcement", "kind": r["action"],
+                "announcement_id": r["announcement_id"],
+                "code": r["code"], "security_id": r["security_id"],
+                "effective_date": _dt.date.fromisoformat(r["effective_date"]),
+                "received_at": _parse_dt(r["received_at"]),
+                "source": r["source"], "source_record": r["source_record"],
+                "reason": r["reason"], "supersedes": r["supersedes"],
             })
         return sorted(events, key=lambda x: x["received_at"])
 
@@ -790,6 +1300,20 @@ class Dataset:
                 "reason": r["reason"],
                 "source": "", "source_record": "",
             })
+        for r in self.conn.execute(
+            "SELECT * FROM identity_announcement WHERE effective_date <= ?"
+            " AND received_at <= ? ORDER BY received_at, seq",
+            (bd.isoformat(), end),
+        ):
+            items.append({
+                "type": "identity_announcement", "kind": r["action"],
+                "announcement_id": r["announcement_id"],
+                "code": r["code"], "security_id": r["security_id"],
+                "effective_date": _dt.date.fromisoformat(r["effective_date"]),
+                "received_at": _parse_dt(r["received_at"]),
+                "source": r["source"], "source_record": r["source_record"],
+                "reason": r["reason"], "supersedes": r["supersedes"],
+            })
         return sorted(items, key=lambda x: x["received_at"])
 
     def compare_rule_adjustment(
@@ -868,7 +1392,8 @@ class Dataset:
         """数据集指纹，保存后重开应保持一致。"""
         counts = {}
         for table in ("security", "trading_session", "corp_split",
-                      "quote_event", "adjudication", "priority_rule"):
+                      "quote_event", "adjudication", "priority_rule",
+                      "identity_announcement"):
             counts[table] = self.conn.execute(
                 f"SELECT COUNT(*) FROM {table}"
             ).fetchone()[0]

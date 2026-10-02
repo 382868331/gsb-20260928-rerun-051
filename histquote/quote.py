@@ -9,6 +9,7 @@ import enum
 
 class QuoteStatus(str, enum.Enum):
     OK = "ok"              # 该时点已知有效行情
+    AMBIGUOUS = "ambiguous"  # 显示代码可指向多个证券，资料不足，不能自动拼接
     CANCELLED = "cancelled"  # 记录被发布方撤销（如错挂代码）
     WITHDRAWN = "withdrawn"  # 来源撤回：所有候选记录均被其来源收回
     SUSPENDED = "suspended"  # 当日停牌
@@ -42,6 +43,7 @@ class QuoteEvent:
     reason: str = ""
     source: str = ""
     source_record: str = ""
+    reported_code: str = ""
     target_source: str = ""
     target_record: str = ""
 

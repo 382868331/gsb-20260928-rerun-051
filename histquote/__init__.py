@@ -6,7 +6,7 @@
 
 from .adjudication import Adjudication
 from .dataset import Dataset
-from .identity import Security, Split
+from .identity import IdentityAnnouncement, PortfolioPosition, Security, Split
 from .priority import PriorityRule
 from .quote import Quote, QuoteEvent, QuoteStatus
 from .query import QuoteView, SourceCandidate
@@ -17,6 +17,8 @@ __all__ = [
     "PriorityRule",
     "Security",
     "Split",
+    "IdentityAnnouncement",
+    "PortfolioPosition",
     "Quote",
     "QuoteEvent",
     "QuoteStatus",

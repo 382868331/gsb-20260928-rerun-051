@@ -5,6 +5,10 @@
 >
 > 第三轮新增：**来源优先级规则的历史有效范围**与**规则调整前后的研究对照**
 > （`examples/demo_priority_rules.py`，`tests/test_priority_rules.py`）。
+>
+> 第四轮新增：**证券更名、代码复用、跨市场转板的身份公告**，
+> 身份映射确认/撤回、迟到报价归属、组合身份去重与调整前后对照
+> （`examples/demo_identity.py`，`tests/test_identity_mapping.py`）。
 
 纯 Python 标准库 + SQLite，离线运行，不联网下载任何行情。核心解决一个问题：
 **回测站在某个历史时点，只能看到当时实际已经收到的数据；后来补齐的价格、迟到的修订、事后才公告的拆分因子都不能被提前使用。**
@@ -20,13 +24,40 @@
 
 ## 模块
 
-- `histquote/identity.py`：证券身份 `Security`；拆分 `Split`（除权日 + 因子 + 收到时间）。
+- `histquote/identity.py`：稳定证券身份 `Security`；拆分 `Split`；
+  身份公告 `IdentityAnnouncement`；组合持仓 `PortfolioPosition`。
 - `histquote/calendar.py`：交易日历，区分开市日与非交易日。
 - `histquote/quote.py`：`Quote`、`QuoteEvent`、`QuoteStatus`。
 - `histquote/dataset.py`：SQLite 存储、事件写入、as-of 合并查询、保存/重开、数据指纹。
 - `histquote/query.py`：查询结果 `QuoteView`（含状态、复权收盘、来源、来源记录号）。
 - `examples/demo.py`：虚构样例演示。
 - `tests/test_bitemporal.py`：9 个语义测试。
+
+## 证券身份与代码映射
+
+- 稳定身份使用 `security_id`；显示代码 `code` 可更名、复用或跨市场转板。
+- `IdentityAnnouncement` 是 append-only 公告，包含 `effective_date` 与
+  `received_at`：研究者只能在收到公告后使用，且只解释公告生效日之后/当日。
+- `action="confirm"` 确认映射；`action="withdraw"` 撤回指定公告。
+  新确认公告可用 `supersedes` 终止旧映射；撤回替代公告后，未被撤回的旧映射恢复。
+- 报价事件可携带 `reported_code`。公告不足时，`quote_by_code(...)` 返回
+  `ambiguous`，把原报价保留为候选，不自动选择价格，也不把不同证券价格接成序列。
+- 迟到的旧代码报价按其**业务日期**适用的身份解释；已确认给旧证券的报价不会流入新证券。
+- `QuoteView` 同时返回采用的 `security_id`、公告号、候选身份、证券名称与
+  `identity_source_rule`；早期研究视角和原始报价始终可复算。
+
+## 身份调整前后的组合对照
+
+- `research_portfolio(positions, date, known_at)` 按当时可见的身份公告解析持仓，
+  并以稳定 `security_id` 去重；同一组合中用新旧显示代码同时持有同一证券时，
+  行情只纳入一次并合并数量。
+- 同一显示代码对应的新旧证券仍可通过显式稳定身份同时持有，二者不会互相吞并。
+- `compare_identity_adjustment(...)` 区分：
+  - `price_changes`：同一稳定证券的真实价格变化；
+  - `security_range_changes`：组合纳入/剔除证券的范围变化；
+  - `name_only_changes`：稳定身份与价格不变，仅是名称变化。
+- 公告、报价和旧解释均追加保存；保存重开后，已保存研究仍按当时的
+  `known_at` / 身份视角解释。
 
 ## 状态语义（回测必须区分）
 
@@ -97,6 +128,7 @@
 .venv/bin/python -m examples.demo
 .venv/bin/python -m examples.demo_conflict
 .venv/bin/python -m examples.demo_priority_rules
+.venv/bin/python -m examples.demo_identity
 .venv/bin/python -m unittest discover -s tests
 ```
 
