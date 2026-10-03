@@ -30,6 +30,58 @@ class Split:
 
 
 @dataclasses.dataclass(frozen=True)
+class CorporateAction:
+    """一笔公司行动的一个不可变公告版本。
+
+    status 可取 proposed / confirmed / revised / withdrawn。withdrawn 通过
+    target_announcement_id 精确撤回同一 action_id 的旧公告版本。
+    """
+
+    action_id: str
+    announcement_id: str
+    kind: str  # split / exchange / cash_compensation
+    from_security_id: str
+    effective_date: _dt.date
+    received_at: _dt.datetime
+    candidate_from_security_ids: tuple[str, ...] = ()
+    to_security_id: str = ""
+    ratio: float = 1.0
+    cash_per_share: float = 0.0
+    fractional_policy: str = "cash"  # cash / retain / undetermined
+    fractional_price: float | None = None
+    new_unit_value: float | None = None
+    cash_value: float | None = None
+    status: str = "confirmed"
+    supersedes: str = ""
+    source: str = ""
+    source_record: str = ""
+    reason: str = ""
+    target_announcement_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.action_id:
+            raise ValueError("公司行动必须包含 action_id")
+        if not self.announcement_id:
+            raise ValueError("公司行动公告必须包含 announcement_id")
+        if self.kind not in {"split", "exchange", "cash_compensation"}:
+            raise ValueError(f"未知公司行动类型: {self.kind}")
+        if self.status not in {"proposed", "confirmed", "revised", "withdrawn"}:
+            raise ValueError(f"未知公司行动公告状态: {self.status}")
+        if not self.from_security_id and not self.candidate_from_security_ids:
+            raise ValueError("公司行动必须指定原证券或候选原证券")
+        if self.ratio <= 0:
+            raise ValueError("公司行动比例必须为正数")
+        if self.cash_per_share < 0:
+            raise ValueError("每股现金补偿不能为负数")
+        if self.fractional_policy not in {"cash", "retain", "undetermined"}:
+            raise ValueError(f"未知零碎份额处理方式: {self.fractional_policy}")
+        if self.status == "withdrawn" and not self.target_announcement_id:
+            raise ValueError("公司行动撤回必须指定目标公告")
+        if self.kind == "exchange" and not self.to_security_id:
+            raise ValueError("换股合并必须指定新证券")
+
+
+@dataclasses.dataclass(frozen=True)
 class IdentityAnnouncement:
     """显示代码与稳定证券身份之间关系的不可变公告。
 

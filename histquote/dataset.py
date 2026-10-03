@@ -19,12 +19,14 @@ from pathlib import Path
 
 from .calendar import TradingCalendar
 from .adjudication import Adjudication
-from .identity import IdentityAnnouncement, IdentityResolution, Security, Split
+from .identity import (
+    CorporateAction, IdentityAnnouncement, IdentityResolution, Security, Split,
+)
 from .priority import PriorityRule
 from .query import QuoteView, SourceCandidate
 from .quote import CodeQuoteEvent, Quote, QuoteEvent, QuoteStatus
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _parse_dt(value: str | _dt.datetime) -> _dt.datetime:
@@ -71,6 +73,31 @@ CREATE TABLE IF NOT EXISTS corp_split(
     received_at TEXT NOT NULL,
     PRIMARY KEY (security_id, ex_date, received_at)
 );
+CREATE TABLE IF NOT EXISTS corporate_action(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    action_id TEXT NOT NULL,
+    announcement_id TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    from_security_id TEXT NOT NULL DEFAULT '',
+    candidate_from_security_ids TEXT NOT NULL DEFAULT '[]',
+    to_security_id TEXT NOT NULL DEFAULT '',
+    effective_date TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    ratio REAL NOT NULL,
+    cash_per_share REAL NOT NULL DEFAULT 0,
+    fractional_policy TEXT NOT NULL DEFAULT 'cash',
+    fractional_price REAL,
+    new_unit_value REAL,
+    cash_value REAL,
+    status TEXT NOT NULL,
+    supersedes TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    source_record TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    target_announcement_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_corporate_action_asof
+    ON corporate_action(action_id, received_at, seq);
 CREATE TABLE IF NOT EXISTS quote_event(
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     security_id TEXT NOT NULL,
@@ -150,6 +177,7 @@ CREATE TABLE IF NOT EXISTS saved_research(
     business_date TEXT NOT NULL,
     known_at TEXT NOT NULL,
     identity_as_of TEXT NOT NULL DEFAULT '',
+    corporate_action_as_of TEXT NOT NULL DEFAULT '',
     payload TEXT NOT NULL
 );
 """
@@ -158,6 +186,9 @@ _EXTRA_COLUMNS = {
     "quote_event": {
         "target_source": "TEXT NOT NULL DEFAULT ''",
         "target_record": "TEXT NOT NULL DEFAULT ''",
+    },
+    "saved_research": {
+        "corporate_action_as_of": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -506,6 +537,121 @@ class Dataset:
             ),
         )
         self.conn.commit()
+
+    # ---------- 公司行动（预告/修订/撤回，append-only） ----------
+
+    def add_corporate_action(self, action: CorporateAction) -> tuple[bool, int | None]:
+        if action.source and action.source_record:
+            existing = self.conn.execute(
+                "SELECT seq FROM corporate_action WHERE source=? AND source_record=?",
+                (action.source, action.source_record),
+            ).fetchone()
+            if existing is not None:
+                return False, existing["seq"]
+        existing = self.conn.execute(
+            "SELECT seq FROM corporate_action WHERE announcement_id=?",
+            (action.announcement_id,),
+        ).fetchone()
+        if existing is not None:
+            return False, existing["seq"]
+        cur = self.conn.execute(
+            "INSERT INTO corporate_action(action_id, announcement_id, kind,"
+            " from_security_id, candidate_from_security_ids, to_security_id,"
+            " effective_date, received_at, ratio, cash_per_share,"
+            " fractional_policy, fractional_price, new_unit_value, cash_value,"
+            " status, supersedes, source, source_record, reason,"
+            " target_announcement_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                action.action_id, action.announcement_id, action.kind,
+                action.from_security_id,
+                json.dumps(list(action.candidate_from_security_ids),
+                           ensure_ascii=False),
+                action.to_security_id, action.effective_date.isoformat(),
+                action.received_at.isoformat(), action.ratio,
+                action.cash_per_share, action.fractional_policy,
+                action.fractional_price, action.new_unit_value,
+                action.cash_value, action.status, action.supersedes,
+                action.source, action.source_record, action.reason,
+                action.target_announcement_id,
+            ),
+        )
+        self.conn.commit()
+        return True, cur.lastrowid
+
+    def corporate_action_announcements(self) -> list[CorporateAction]:
+        rows = self.conn.execute(
+            "SELECT * FROM corporate_action ORDER BY effective_date, received_at, seq"
+        )
+        return [self._corporate_action_from_row(r) for r in rows]
+
+    @staticmethod
+    def _corporate_action_from_row(row: sqlite3.Row) -> CorporateAction:
+        return CorporateAction(
+            action_id=row["action_id"],
+            announcement_id=row["announcement_id"],
+            kind=row["kind"],
+            from_security_id=row["from_security_id"],
+            candidate_from_security_ids=tuple(json.loads(
+                row["candidate_from_security_ids"] or "[]"
+            )),
+            to_security_id=row["to_security_id"],
+            effective_date=_dt.date.fromisoformat(row["effective_date"]),
+            received_at=_parse_dt(row["received_at"]),
+            ratio=row["ratio"],
+            cash_per_share=row["cash_per_share"],
+            fractional_policy=row["fractional_policy"],
+            fractional_price=row["fractional_price"],
+            new_unit_value=row["new_unit_value"],
+            cash_value=row["cash_value"],
+            status=row["status"],
+            supersedes=row["supersedes"],
+            source=row["source"],
+            source_record=row["source_record"],
+            reason=row["reason"],
+            target_announcement_id=row["target_announcement_id"],
+        )
+
+    def corporate_action_announcement(
+        self, announcement_id: str, known_at: str | _dt.datetime
+    ) -> CorporateAction:
+        ka = _parse_dt(known_at)
+        row = self.conn.execute(
+            "SELECT * FROM corporate_action WHERE announcement_id=? AND received_at <= ?",
+            (announcement_id, ka.isoformat()),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"截至该视角不可见或不存在的公司行动公告: {announcement_id}")
+        return self._corporate_action_from_row(row)
+
+    def corporate_actions_at(
+        self,
+        known_at: str | _dt.datetime,
+        business_date: str | _dt.date | None = None,
+        include_superseded: bool = False,
+    ) -> list[CorporateAction]:
+        """返回某视角可见的最新行动版本；默认不含已被撤回或修订的版本。"""
+        ka = _parse_dt(known_at)
+        rows = list(self.conn.execute(
+            "SELECT * FROM corporate_action WHERE received_at <= ? ORDER BY received_at, seq",
+            (ka.isoformat(),),
+        ))
+        if business_date is not None:
+            bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
+            rows = [r for r in rows
+                    if _dt.date.fromisoformat(r["effective_date"]) <= bd]
+        if include_superseded:
+            return [self._corporate_action_from_row(r) for r in rows]
+        latest: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            latest[row["action_id"]] = row
+        active = []
+        for row in latest.values():
+            if row["status"] == "withdrawn":
+                continue
+            active.append(row)
+        return [self._corporate_action_from_row(r) for r in sorted(
+            active, key=lambda r: (r["effective_date"], r["received_at"], r["seq"])
+        )]
 
     # ---------- 行情写入 ----------
 
@@ -980,6 +1126,336 @@ class Dataset:
         dates = self.calendar.sessions(start, end) if only_sessions else _enumerate_dates(start, end)
         return [self.quote_at(security_id, d, ka) for d in dates]
 
+    # ---------- 公司行动持仓采用与逐笔调整 ----------
+
+    def apply_corporate_actions(
+        self,
+        holdings: list[dict],
+        decisions: list[dict],
+        known_at: str | _dt.datetime,
+    ) -> dict:
+        """按用户明确采用的公告版本逐笔调整持仓，不覆盖原交易。
+
+        每份原始份额只能从当前批次中扣减一次；部分采用后，未采用部分仍保留在
+        原证券。代码变化只改变 security_id/显示身份，不改变经济数量；换股后的
+        报价跳变不在这里确认为投资收益。
+        """
+        ka = _parse_dt(known_at)
+        lots = [self._initial_holding_lot(h, i) for i, h in enumerate(holdings)]
+        ledger: list[dict] = []
+        unresolved_decisions = []
+
+        for index, decision in enumerate(decisions):
+            action = self.corporate_action_announcement(
+                decision["announcement_id"], ka
+            )
+            source_id = decision.get("security_id", action.from_security_id)
+            if not source_id and len(action.candidate_from_security_ids) == 1:
+                source_id = action.candidate_from_security_ids[0]
+            if not source_id:
+                unresolved_decisions.append({
+                    "decision": index,
+                    "announcement_id": action.announcement_id,
+                    "candidate_security_ids": list(action.candidate_from_security_ids),
+                    "reason": "source-security-undetermined",
+                })
+                continue
+            if (action.candidate_from_security_ids
+                    and source_id not in action.candidate_from_security_ids
+                    and source_id != action.from_security_id):
+                raise ValueError("不能把来源未确认的公司行动指定给候选外证券")
+
+            requested_lot_ids = set(decision.get("lot_ids",
+                                        decision.get("source_lot_ids", [])))
+            requested = decision.get("quantity")
+            available = sum(l["remaining_quantity"] for l in lots
+                            if l["security_id"] == source_id and l["open"]
+                            and (not requested_lot_ids
+                                 or l["lot_id"] in requested_lot_ids))
+            selected_quantity = available if requested is None else float(requested)
+            if selected_quantity < 0 or selected_quantity > available + 1e-9:
+                raise ValueError("公司行动采用数量超过当前可用份额")
+            if available:
+                selected_quantity = min(selected_quantity, available)
+
+            target_id = action.to_security_id or source_id
+            is_cash_only = action.kind == "cash_compensation"
+            if is_cash_only:
+                gross_quantity = selected_quantity
+                whole_quantity = int(selected_quantity)
+                fractional_quantity = 0.0
+            else:
+                gross_quantity = round(selected_quantity * action.ratio, 8)
+                whole_quantity = int(gross_quantity)
+                fractional_quantity = round(gross_quantity - whole_quantity, 8)
+            policy = decision.get("fractional_policy", action.fractional_policy)
+            fractional_cash = None
+            undetermined = []
+            if fractional_quantity and policy == "cash":
+                if action.fractional_price is None:
+                    undetermined.append("fractional-cash-price")
+                else:
+                    fractional_cash = round(
+                        fractional_quantity * action.fractional_price, 6
+                    )
+            elif fractional_quantity and policy == "undetermined":
+                undetermined.append("fractional-disposition")
+
+            action_cash = round(selected_quantity * action.cash_per_share, 6)
+            total_cash = round((fractional_cash or 0.0) + action_cash, 6)
+            allocations = []
+            remaining_to_select = selected_quantity
+
+            for lot in lots:
+                if remaining_to_select <= 1e-10:
+                    break
+                if not lot["open"] or lot["security_id"] != source_id:
+                    continue
+                if requested_lot_ids and lot["lot_id"] not in requested_lot_ids:
+                    continue
+                take = round(min(lot["remaining_quantity"], remaining_to_select), 8)
+                old_cost = lot["cost_basis"]
+                selected_cost = self._money(
+                    lot["cost_basis"] * take / lot["quantity"]
+                ) if lot["quantity"] else 0.0
+                if is_cash_only:
+                    lot["remaining_quantity"] = round(lot["remaining_quantity"] - take, 8)
+                    lot["quantity"] = lot["remaining_quantity"]
+                    lot["cost_basis"] = self._money(old_cost - selected_cost)
+                    if lot["remaining_quantity"] <= 1e-10:
+                        lot["open"] = False
+                    cash_value = take * (action.cash_value or action.cash_per_share)
+                    cash_cost = selected_cost if cash_value else 0.0
+                    undetermined_cost = not bool(cash_value)
+                    if undetermined_cost:
+                        undetermined.append(f"lot-{lot['lot_id']}-cost-allocation")
+                    adjusted_lot = {
+                        "lot_id": f"{lot['lot_id']}->{action.action_id}:{action.announcement_id}",
+                        "source_lot_id": lot["lot_id"],
+                        "security_id": source_id,
+                        "original_security_id": lot["original_security_id"],
+                        "original_quantity": take,
+                        "quantity": take,
+                        "remaining_quantity": take,
+                        "cost_basis": self._money(selected_cost - cash_cost),
+                        "open": True,
+                        "announcement_ids": lot["announcement_ids"]
+                        + [action.announcement_id],
+                    }
+                    lots.append(adjusted_lot)
+                    allocations.append({
+                        "source_lot_id": lot["lot_id"],
+                        "security_id": source_id,
+                        "selected_quantity": take,
+                        "remaining_quantity": lot["remaining_quantity"],
+                        "selected_cost_basis": selected_cost,
+                        "new_lot_id": adjusted_lot["lot_id"],
+                        "new_security_id": source_id,
+                        "new_quantity": take,
+                        "new_cost_basis": adjusted_lot["cost_basis"],
+                        "cash_cost_basis": cash_cost,
+                        "fractional_quantity": 0.0,
+                        "fractional_disposition": "",
+                    })
+                    remaining_to_select = round(remaining_to_select - take, 8)
+                    continue
+
+                lot["remaining_quantity"] = round(lot["remaining_quantity"] - take, 8)
+                lot["quantity"] = lot["remaining_quantity"]
+                lot["cost_basis"] = self._money(old_cost - selected_cost)
+                if lot["remaining_quantity"] <= 1e-10:
+                    lot["open"] = False
+                resulting_quantity = round(take * action.ratio, 8)
+                result_whole = int(resulting_quantity)
+                result_fraction = round(resulting_quantity - result_whole, 8)
+                delivered_quantity = result_whole
+                retained_fraction = 0.0
+                if result_fraction and policy == "retain":
+                    delivered_quantity = round(result_whole + result_fraction, 8)
+                elif result_fraction and policy == "undetermined":
+                    undetermined.append(f"lot-{lot['lot_id']}-fractional-disposition")
+                elif result_fraction and action.fractional_price is None:
+                    undetermined.append(f"lot-{lot['lot_id']}-fractional-cash-price")
+
+                stock_cost, cash_cost, undetermined_cost = self._allocate_action_cost(
+                    action, selected_cost, result_whole, result_fraction, policy,
+                    take, fractional_cash is not None,
+                )
+                if undetermined_cost:
+                    undetermined.append(f"lot-{lot['lot_id']}-cost-allocation")
+                new_lot = None
+                if delivered_quantity:
+                    new_lot = {
+                        "lot_id": f"{lot['lot_id']}->{action.action_id}:{action.announcement_id}",
+                        "source_lot_id": lot["lot_id"],
+                        "security_id": target_id,
+                        "original_security_id": lot["original_security_id"],
+                        "original_quantity": resulting_quantity,
+                        "quantity": delivered_quantity,
+                        "remaining_quantity": delivered_quantity,
+                        "cost_basis": stock_cost,
+                        "open": True,
+                        "announcement_ids": lot["announcement_ids"]
+                        + [action.announcement_id],
+                    }
+                    lots.append(new_lot)
+                allocations.append({
+                    "source_lot_id": lot["lot_id"],
+                    "security_id": source_id,
+                    "selected_quantity": take,
+                    "remaining_quantity": lot["remaining_quantity"],
+                    "selected_cost_basis": selected_cost,
+                    "new_lot_id": new_lot["lot_id"] if new_lot else "",
+                    "new_security_id": target_id if delivered_quantity else "",
+                    "new_quantity": delivered_quantity,
+                    "new_cost_basis": stock_cost,
+                    "cash_cost_basis": cash_cost,
+                    "fractional_quantity": result_fraction,
+                    "fractional_disposition": policy if result_fraction else "",
+                })
+                remaining_to_select = round(remaining_to_select - take, 8)
+
+            ledger.append({
+                "decision": index,
+                "action_id": action.action_id,
+                "announcement_id": action.announcement_id,
+                "kind": action.kind,
+                "status": action.status,
+                "source_security_id": source_id,
+                "new_security_id": target_id if action.kind == "exchange" else "",
+                "selected_quantity": selected_quantity,
+                "gross_result_quantity": gross_quantity,
+                "whole_quantity": whole_quantity,
+                "fractional_quantity": fractional_quantity,
+                "fractional_disposition": policy if fractional_quantity else "",
+                "fractional_cash": fractional_cash,
+                "cash_compensation": (
+                    round(selected_quantity * action.cash_per_share, 6)
+                    if is_cash_only else action_cash
+                ),
+                "cash_in_lieu": (
+                    fractional_cash if fractional_cash is not None and not is_cash_only
+                    else 0.0
+                ),
+                "investment_income": None if undetermined else 0.0,
+                "allocations": allocations,
+                "undetermined": sorted(set(undetermined)),
+            })
+
+        current_lots = self._open_lots_by_security(lots)
+        return {
+            "known_at": ka,
+            "original_holdings": [self._json_safe(h) for h in holdings],
+            "lots": [self._public_lot(l) for l in lots],
+            "positions": current_lots,
+            "adjustments": ledger,
+            "unresolved_decisions": unresolved_decisions,
+            "cash_total": round(sum(x["cash_compensation"] + x["cash_in_lieu"]
+                                    for x in ledger), 6),
+        }
+
+    @staticmethod
+    def _initial_holding_lot(holding: dict, position: int) -> dict:
+        quantity = float(holding.get("quantity", holding.get("weight", 0.0)))
+        cost = holding.get("cost_basis", holding.get("cost", 0.0))
+        return {
+            "lot_id": holding.get("lot_id", f"lot-{position}"),
+            "source_lot_id": "",
+            "security_id": holding.get("security_id", ""),
+            "original_security_id": holding.get("security_id", ""),
+            "original_quantity": quantity,
+            "quantity": quantity,
+            "remaining_quantity": quantity,
+            "cost_basis": float(cost or 0.0),
+            "open": quantity > 0,
+            "announcement_ids": [],
+        }
+
+    @staticmethod
+    def _money(value: float) -> float:
+        return round(value, 6)
+
+    def _allocate_action_cost(
+        self, action: CorporateAction, selected_cost: float,
+        whole: int, fraction: float, policy: str, selected_quantity: float,
+        fractional_cash_known: bool,
+    ) -> tuple[float, float, bool]:
+        if selected_cost == 0:
+            return 0.0, 0.0, False
+        cash_value = 0.0
+        if action.kind == "exchange":
+            cash_value += selected_quantity * action.cash_per_share
+        if fraction and policy == "cash" and fractional_cash_known:
+            cash_value += fraction * (action.fractional_price or 0.0)
+        stock_value = (
+            whole * action.new_unit_value
+            if action.new_unit_value is not None else None
+        )
+        if action.cash_value is not None:
+            cash_value = selected_quantity * action.cash_value + (
+                fraction * (action.fractional_price or 0.0)
+                if fraction and policy == "cash" and fractional_cash_known else 0.0
+            )
+        if stock_value is None and cash_value:
+            return selected_cost, 0.0, True
+        if stock_value and stock_value + cash_value > 0:
+            stock_cost = selected_cost * stock_value / (stock_value + cash_value)
+            return self._money(stock_cost), self._money(selected_cost - stock_cost), False
+        return self._money(selected_cost), 0.0, False
+
+    def _open_lots_by_security(self, lots: list[dict]) -> tuple[dict, ...]:
+        grouped: dict[str, dict] = {}
+        for lot in lots:
+            quantity = round(lot["remaining_quantity"], 8)
+            if quantity <= 1e-10:
+                continue
+            item = grouped.setdefault(lot["security_id"], {
+                "security_id": lot["security_id"],
+                "quantity": 0.0,
+                "cost_basis": 0.0,
+                "lot_ids": [],
+            })
+            item["quantity"] = round(item["quantity"] + quantity, 8)
+            if lot["original_quantity"]:
+                item["cost_basis"] += (
+                    lot["cost_basis"] * quantity / lot["quantity"]
+                )
+            item["lot_ids"].append(lot["lot_id"])
+        for item in grouped.values():
+            item["cost_basis"] = self._money(item["cost_basis"])
+        return tuple(grouped[key] for key in sorted(grouped))
+
+    @staticmethod
+    def _public_lot(lot: dict) -> dict:
+        return {
+            "lot_id": lot["lot_id"],
+            "source_lot_id": lot["source_lot_id"],
+            "security_id": lot["security_id"],
+            "original_security_id": lot["original_security_id"],
+            "original_quantity": lot["original_quantity"],
+            "quantity": lot["remaining_quantity"],
+            "cost_basis": lot["cost_basis"],
+            "open": lot["open"],
+            "announcement_ids": list(lot["announcement_ids"]),
+        }
+
+    def compare_corporate_action_scenarios(
+        self,
+        holdings: list[dict],
+        original_decisions: list[dict],
+        revised_decisions: list[dict],
+        known_at: str | _dt.datetime,
+    ) -> dict:
+        original = self.apply_corporate_actions(holdings, original_decisions, known_at)
+        revised = self.apply_corporate_actions(holdings, revised_decisions, known_at)
+        return {
+            "known_at": _parse_dt(known_at),
+            "original": original,
+            "revised": revised,
+            "original_positions": original["positions"],
+            "revised_positions": revised["positions"],
+        }
+
     # ---------- 组合研究与身份映射调整对照 ----------
 
     def evaluate_portfolio(
@@ -1154,24 +1630,35 @@ class Dataset:
         known_at: str | _dt.datetime,
         saved_at: str | _dt.datetime,
         identity_as_of: str | _dt.datetime | None = None,
+        corporate_action_decisions: list[dict] | None = None,
+        corporate_action_as_of: str | _dt.datetime | None = None,
     ) -> dict:
         """保存组合研究及其当时身份解释；后续公告不改写该研究。"""
         result = self.evaluate_portfolio(holdings, business_date, known_at, identity_as_of)
+        action_result = None
+        ca_ka = _parse_dt(corporate_action_as_of) if corporate_action_as_of else _parse_dt(known_at)
+        if corporate_action_decisions is not None:
+            action_result = self.apply_corporate_actions(
+                holdings, corporate_action_decisions, ca_ka
+            )
+            result["corporate_actions"] = action_result
         payload = {
             "research_id": research_id,
             "holdings": holdings,
             "result": self._json_safe(result),
+            "corporate_action_decisions": corporate_action_decisions,
         }
         self.conn.execute(
             "INSERT INTO saved_research(research_id, saved_at,"
-            " business_date, known_at, identity_as_of, payload)"
-            " VALUES (?,?,?,?,?,?)",
+            " business_date, known_at, identity_as_of,"
+            " corporate_action_as_of, payload) VALUES (?,?,?,?,?,?,?)",
             (
                 research_id,
                 _parse_dt(saved_at).isoformat(),
                 result["business_date"].isoformat(),
                 result["known_at"].isoformat(),
                 result["identity_as_of"].isoformat(),
+                ca_ka.isoformat(),
                 json.dumps(payload, ensure_ascii=False, default=_json_default),
             ),
         )
@@ -1189,6 +1676,10 @@ class Dataset:
         payload["business_date"] = _dt.date.fromisoformat(row["business_date"])
         payload["known_at"] = _parse_dt(row["known_at"])
         payload["identity_as_of"] = _parse_dt(row["identity_as_of"])
+        payload["corporate_action_as_of"] = (
+            _parse_dt(row["corporate_action_as_of"])
+            if row["corporate_action_as_of"] else None
+        )
         return payload
 
     def reopen_saved_research(self, research_id: str) -> dict:
@@ -1198,6 +1689,17 @@ class Dataset:
             saved["holdings"], saved["business_date"], saved["known_at"],
             saved["identity_as_of"],
         )
+        saved_actions = saved["result"].get("corporate_actions")
+        reopened_actions = None
+        same_actions = True
+        if saved.get("corporate_action_decisions") is not None:
+            action_result = self.apply_corporate_actions(
+                saved["holdings"], saved["corporate_action_decisions"],
+                saved.get("corporate_action_as_of") or saved["known_at"],
+            )
+            reopened_actions = action_result
+            reopened["corporate_actions"] = action_result
+            same_actions = self._json_safe(saved_actions) == self._json_safe(action_result)
         return {
             "saved": saved,
             "reopened": reopened,
@@ -1205,6 +1707,9 @@ class Dataset:
             == reopened["portfolio_value"],
             "same_security_ids": tuple(saved["result"]["security_ids"])
             == reopened["security_ids"],
+            "same_corporate_actions": same_actions,
+            "saved_corporate_actions": saved_actions,
+            "reopened_corporate_actions": reopened_actions,
         }
 
     @classmethod
@@ -1327,6 +1832,23 @@ class Dataset:
                 "received_at": _parse_dt(r["received_at"]),
                 "source": "", "source_record": "",
             })
+        for r in self.conn.execute(
+            "SELECT * FROM corporate_action WHERE received_at > ? AND received_at <= ?"
+            " ORDER BY received_at, seq",
+            (s.isoformat(), e.isoformat()),
+        ):
+            events.append({
+                "type": "corporate_action", "kind": r["kind"],
+                "action_id": r["action_id"],
+                "announcement_id": r["announcement_id"],
+                "from_security_id": r["from_security_id"],
+                "to_security_id": r["to_security_id"],
+                "ratio": r["ratio"],
+                "cash_per_share": r["cash_per_share"],
+                "status": r["status"],
+                "received_at": _parse_dt(r["received_at"]),
+                "source": r["source"], "source_record": r["source_record"],
+            })
         return sorted(events, key=lambda x: x["received_at"])
 
     def explain_viewpoint_diff(
@@ -1401,6 +1923,29 @@ class Dataset:
                 "ratio": r["ratio"],
                 "received_at": _parse_dt(r["received_at"]),
                 "source": "", "source_record": "",
+            })
+        for r in self.conn.execute(
+            "SELECT * FROM corporate_action WHERE received_at <= ?"
+            " ORDER BY received_at, seq",
+            (end,),
+        ):
+            items.append({
+                "type": "corporate_action", "kind": r["kind"],
+                "action_id": r["action_id"],
+                "announcement_id": r["announcement_id"],
+                "from_security_id": r["from_security_id"],
+                "candidate_from_security_ids": json.loads(
+                    r["candidate_from_security_ids"] or "[]"
+                ),
+                "to_security_id": r["to_security_id"],
+                "effective_date": _dt.date.fromisoformat(r["effective_date"]),
+                "ratio": r["ratio"],
+                "cash_per_share": r["cash_per_share"],
+                "fractional_policy": r["fractional_policy"],
+                "status": r["status"],
+                "supersedes": r["supersedes"],
+                "received_at": _parse_dt(r["received_at"]),
+                "source": r["source"], "source_record": r["source_record"],
             })
         for r in self.conn.execute(
             "SELECT * FROM priority_rule WHERE received_at != ''"

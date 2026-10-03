@@ -8,6 +8,9 @@
 >
 > 第四轮新增：**证券身份公告、显示代码复用/跨市场转板、映射撤回、组合身份调整对照**
 > （`examples/demo_identity.py`，`tests/test_identity_portfolio.py`）。
+>
+> 第五轮新增：**拆股、换股合并与现金补偿的公告版本、用户采用、逐批成本/现金追踪**
+> （`tests/test_corporate_actions.py`）。
 
 纯 Python 标准库 + SQLite，离线运行，不联网下载任何行情。核心解决一个问题：
 **回测站在某个历史时点，只能看到当时实际已经收到的数据；后来补齐的价格、迟到的修订、事后才公告的拆分因子都不能被提前使用。**
@@ -23,7 +26,8 @@
 
 ## 模块
 
-- `histquote/identity.py`：证券身份 `Security`；拆分 `Split`（除权日 + 因子 + 收到时间）。
+- `histquote/identity.py`：证券身份 `Security`；拆分 `Split`（除权日 + 因子 + 收到时间）；
+  公司行动 `CorporateAction`（预告/确认/修订/撤回、换股、现金补偿、零碎份额去向）。
 - `histquote/identity.py`：`IdentityAnnouncement`（确认/候选/改名/撤回）与
   `IdentityResolution`（查询采用的身份、公告和来源规则）。
 - `histquote/calendar.py`：交易日历，区分开市日与非交易日。
@@ -123,6 +127,24 @@
   - `name-only-change`：稳定证券不变，仅改名公告/身份解释变化。
 - `save_portfolio_research()` 保存持仓、研究时点、`identity_as_of` 和当时结果；
   后续代码重分配、公告迟到或撤回后，`reopen_saved_research()` 仍按当时身份解释。
+
+## 公司行动与持仓身份对账
+
+- `add_corporate_action()` 只追加公告版本：同一 `action_id` 可有 `proposed`、
+  `confirmed`、`revised` 和精确 `withdrawn`；`announcement_id` 标识当时采用的版本。
+- `apply_corporate_actions()` 只在用户传入采用决策后调整，自动公告不会改持仓；
+  原持仓保留在 `original_holdings`，调整以不可覆盖的批次和 `source_lot_id` 链追踪。
+- 拆股改变数量但不改变稳定身份；换股改变 `security_id` 但不能把代码跳变解释成收益，
+  引擎逐批列出原证券、新证券、数量、成本分配、现金补偿和零碎份额去向。
+- 现金补偿不直接记投资收益；按公告的现金/新证券价值分配成本，估值参数不足时放入
+  `undetermined`，不猜测结果。现金补偿保留原证券数量。
+- 部分采用可用 `quantity` 与 `lot_ids` 指定批次；未采用份额留在原证券，已采用份额
+  不会再被同一或下一次行动重复计入，支持两次公司行动连在一起逐笔追踪。
+- 来源身份未确认时，行动使用 `candidate_from_security_ids` 保存候选；未指定现有证券前
+  决策进入 `unresolved_decisions`，不会自动归属任何证券。
+- `compare_corporate_action_scenarios()` 可并列复算继续采用旧公告和改用修订公告；
+  `save_portfolio_research(..., corporate_action_decisions=...)` 冻结采用决策和
+  `corporate_action_as_of`，后续比例修订或撤回后重开仍按当时可见公告解释。
 
 ## 快速开始
 
