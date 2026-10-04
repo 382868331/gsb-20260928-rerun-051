@@ -8,6 +8,9 @@
 >
 > 第四轮新增：**证券身份公告、显示代码复用/跨市场转板、映射撤回、组合身份调整对照**
 > （`examples/demo_identity.py`，`tests/test_identity_portfolio.py`）。
+>
+> 第五轮新增：**公司行动（拆股、换股合并、现金补偿）与持仓调整**
+> （`examples/demo_corporate_action.py`，`tests/test_corporate_action.py`）。
 
 纯 Python 标准库 + SQLite，离线运行，不联网下载任何行情。核心解决一个问题：
 **回测站在某个历史时点，只能看到当时实际已经收到的数据；后来补齐的价格、迟到的修订、事后才公告的拆分因子都不能被提前使用。**
@@ -123,6 +126,26 @@
   - `name-only-change`：稳定证券不变，仅改名公告/身份解释变化。
 - `save_portfolio_research()` 保存持仓、研究时点、`identity_as_of` 和当时结果；
   后续代码重分配、公告迟到或撤回后，`reopen_saved_research()` 仍按当时身份解释。
+
+## 公司行动与持仓调整
+
+- `add_corporate_action(CorporateAction(...))` 追加拆股（`split`）、换股合并
+  （`merger`）、现金补偿（`cash_compensation`）公告；预告、修订
+  （`supersedes` 旧版本）与撤回（`withdraw` 精确指向目标版本）均 append-only。
+- `corporate_actions_at(security_id, known_at)` 给出某历史视角下生效的公告版本：
+  同一行动先预告、后修订或撤回时，已保存的研究继续按当时可见资料解释。
+- `plan_position_adjustment(action_id, holding)` 逐笔列出数量、成本分配、
+  现金补偿、零碎份额去向与未确定部分；新证券身份未确认时保留候选
+  （`new-security-identity-unconfirmed`），不猜测属于哪个现有证券。
+- 显示代码变化本身不是数量变更；换股后的价格跳变标记为
+  `corporate-action-not-investment-return`，不解释为投资收益。
+- `compare_action_plans(旧公告, 修订公告, holding)` 对照继续采用旧公告与
+  改用修订公告的两套方案，逐字段给出差异。
+- `adopt_corporate_action()` 落库用户采用；部分采用按修订链累计校验，
+  同一份额不能被同时计入两个证券。
+- `apply_action_chain()` 把连续多次公司行动依次作用到同一笔持仓。
+- `holding_adjustments()` 沿证券身份与公司行动追踪每一笔已落库的调整；
+  调整随库保存，重开研究时原交易与报价保持不变。
 
 ## 快速开始
 

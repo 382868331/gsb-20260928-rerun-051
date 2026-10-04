@@ -19,12 +19,13 @@ from pathlib import Path
 
 from .calendar import TradingCalendar
 from .adjudication import Adjudication
+from .corporate_action import CorporateAction
 from .identity import IdentityAnnouncement, IdentityResolution, Security, Split
 from .priority import PriorityRule
 from .query import QuoteView, SourceCandidate
 from .quote import CodeQuoteEvent, Quote, QuoteEvent, QuoteStatus
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _parse_dt(value: str | _dt.datetime) -> _dt.datetime:
@@ -152,6 +153,43 @@ CREATE TABLE IF NOT EXISTS saved_research(
     identity_as_of TEXT NOT NULL DEFAULT '',
     payload TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS corporate_action(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    action_id TEXT NOT NULL UNIQUE,
+    security_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    ex_date TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    ratio REAL NOT NULL DEFAULT 1.0,
+    new_security_id TEXT NOT NULL DEFAULT '',
+    new_security_candidates TEXT NOT NULL DEFAULT '[]',
+    cash_per_share REAL NOT NULL DEFAULT 0.0,
+    fraction_policy TEXT NOT NULL DEFAULT 'cash',
+    fraction_cash_price REAL,
+    supersedes TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    source_record TEXT NOT NULL DEFAULT '',
+    target_action_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_corporate_action_asof
+    ON corporate_action(security_id, received_at, seq);
+CREATE TABLE IF NOT EXISTS position_adjustment(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    adjustment_id TEXT NOT NULL UNIQUE,
+    holding_id TEXT NOT NULL,
+    action_id TEXT NOT NULL,
+    security_id TEXT NOT NULL,
+    new_security_id TEXT NOT NULL DEFAULT '',
+    quantity REAL NOT NULL,
+    cost REAL NOT NULL,
+    adopted_at TEXT NOT NULL,
+    known_at TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_position_adjustment
+    ON position_adjustment(holding_id, security_id, seq);
 """
 
 _EXTRA_COLUMNS = {
@@ -506,6 +544,375 @@ class Dataset:
             ),
         )
         self.conn.commit()
+
+    # ---------- 公司行动：拆股 / 换股合并 / 现金补偿 ----------
+
+    def add_corporate_action(self, action: CorporateAction) -> tuple[bool, int | None]:
+        """追加一条公司行动公告（预告、修订或撤回）。
+
+        公告 append-only：修订用 supersedes 指向旧版本，撤回用
+        target_action_id 精确指向目标版本；旧版本原样保留，历史视角
+        继续按当时可见的资料解释。同一 action_id 重放视为幂等。
+        """
+        aid = action.action_id or f"_auto_action_{uuid.uuid4().hex}"
+        existing = self.conn.execute(
+            "SELECT seq FROM corporate_action WHERE action_id=?", (aid,)
+        ).fetchone()
+        if existing is not None:
+            return False, existing["seq"]
+        cur = self.conn.execute(
+            "INSERT INTO corporate_action(action_id, security_id, kind, ex_date,"
+            " received_at, ratio, new_security_id, new_security_candidates,"
+            " cash_per_share, fraction_policy, fraction_cash_price, supersedes,"
+            " reason, source, source_record, target_action_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                aid, action.security_id, action.kind, action.ex_date.isoformat(),
+                action.received_at.isoformat(), action.ratio,
+                action.new_security_id,
+                json.dumps(list(action.new_security_candidates), ensure_ascii=False),
+                action.cash_per_share, action.fraction_policy,
+                action.fraction_cash_price, action.supersedes, action.reason,
+                action.source, action.source_record, action.target_action_id,
+            ),
+        )
+        self.conn.commit()
+        return True, cur.lastrowid
+
+    @staticmethod
+    def _action_from_row(row: sqlite3.Row) -> CorporateAction:
+        return CorporateAction(
+            security_id=row["security_id"],
+            ex_date=_dt.date.fromisoformat(row["ex_date"]),
+            received_at=_parse_dt(row["received_at"]),
+            kind=row["kind"],
+            action_id=row["action_id"],
+            ratio=row["ratio"],
+            new_security_id=row["new_security_id"],
+            new_security_candidates=tuple(
+                json.loads(row["new_security_candidates"])),
+            cash_per_share=row["cash_per_share"],
+            fraction_policy=row["fraction_policy"],
+            fraction_cash_price=row["fraction_cash_price"],
+            supersedes=row["supersedes"],
+            reason=row["reason"],
+            source=row["source"],
+            source_record=row["source_record"],
+            target_action_id=row["target_action_id"],
+        )
+
+    def corporate_actions(self, security_id: str | None = None) -> list[CorporateAction]:
+        """全部公司行动公告（含被修订与被撤回的版本），按追加顺序。"""
+        if security_id is None:
+            rows = self.conn.execute(
+                "SELECT * FROM corporate_action ORDER BY seq")
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM corporate_action WHERE security_id=? ORDER BY seq",
+                (security_id,))
+        return [self._action_from_row(r) for r in rows]
+
+    def _action_chain_root(self, action_id: str, by_id: dict) -> str:
+        """沿 supersedes 链找到修订链根公告 id。"""
+        seen = set()
+        current = action_id
+        while current in by_id and by_id[current].supersedes and current not in seen:
+            seen.add(current)
+            current = by_id[current].supersedes
+        return current
+
+    def corporate_actions_at(
+        self,
+        security_id: str,
+        known_at: str | _dt.datetime,
+    ) -> list[dict]:
+        """截至 known_at 可见的有效公司行动（每条修订链取当时最新版本）。
+
+        被撤回版本不再生效；整条链都被撤回时该行动不出现。
+        返回项含 action、chain（链上全部版本 id）与 withdrawn_ids。
+        """
+        ka = _parse_dt(known_at)
+        rows = list(self.conn.execute(
+            "SELECT * FROM corporate_action"
+            " WHERE security_id=? AND received_at <= ? ORDER BY received_at, seq",
+            (security_id, ka.isoformat()),
+        ))
+        actions = [self._action_from_row(r) for r in rows]
+        by_id = {a.action_id: a for a in actions}
+        withdrawn = {
+            a.target_action_id for a in actions if a.kind == "withdraw"
+        }
+        chains: dict[str, list[CorporateAction]] = {}
+        for a in actions:
+            if a.kind == "withdraw":
+                continue
+            root = self._action_chain_root(a.action_id, by_id)
+            chains.setdefault(root, []).append(a)
+        effective = []
+        for root, versions in chains.items():
+            live = [v for v in versions if v.action_id not in withdrawn]
+            if not live:
+                continue
+            latest = max(live, key=lambda v: (v.received_at, v.action_id))
+            effective.append({
+                "action": latest,
+                "chain": tuple(v.action_id for v in versions),
+                "withdrawn_ids": tuple(
+                    v.action_id for v in versions if v.action_id in withdrawn),
+            })
+        effective.sort(key=lambda item: (item["action"].ex_date,
+                                         item["action"].received_at))
+        return effective
+
+    def _get_action(self, action_id: str) -> CorporateAction:
+        row = self.conn.execute(
+            "SELECT * FROM corporate_action WHERE action_id=?", (action_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"未找到公司行动公告: {action_id}")
+        return self._action_from_row(row)
+
+    @staticmethod
+    def _plan_for_action(action: CorporateAction, quantity: float,
+                         cost: float) -> dict:
+        """对一笔持仓计算单个公司行动的调整方案（不落库）。"""
+        undetermined: list[str] = []
+        ratio = action.ratio if action.kind in {"split", "merger"} else 1.0
+        raw_quantity = quantity * ratio
+        whole_quantity = float(int(raw_quantity))
+        fractional = round(raw_quantity - whole_quantity, 10)
+
+        fraction_cash = None
+        if fractional > 0:
+            if action.fraction_policy == "cash":
+                if action.fraction_cash_price is None:
+                    undetermined.append("fraction-cash-price-unknown")
+                else:
+                    fraction_cash = round(
+                        fractional * action.fraction_cash_price, 6)
+            elif action.fraction_policy == "carry":
+                whole_quantity = raw_quantity
+                fractional = 0.0
+            # round: 舍去零碎份额，无现金
+
+        if action.kind == "split":
+            target_security = action.security_id
+        elif action.kind == "merger":
+            target_security = action.new_security_id
+            if not target_security:
+                undetermined.append("new-security-identity-unconfirmed")
+        else:
+            target_security = action.security_id
+
+        cash_compensation = round(quantity * action.cash_per_share, 6)
+        new_quantity = whole_quantity if action.kind != "cash_compensation" else quantity
+        cost_after = round(cost - cash_compensation - (fraction_cash or 0.0), 6)
+        per_share_after = (
+            round(cost_after / new_quantity, 6) if new_quantity else None
+        )
+        return {
+            "action_id": action.action_id,
+            "kind": action.kind,
+            "security_id": action.security_id,
+            "ex_date": action.ex_date,
+            "input": {"quantity": quantity, "cost": cost},
+            "ratio": ratio,
+            "new_security_id": target_security if action.kind == "merger" else "",
+            "new_security_candidates": list(action.new_security_candidates),
+            "new_quantity": new_quantity,
+            "fractional_shares": fractional,
+            "fraction_disposition": (
+                action.fraction_policy if fractional > 0 else "none"),
+            "fraction_cash": fraction_cash,
+            "cash_compensation": cash_compensation,
+            "cost_allocation": {
+                "total_cost_before": cost,
+                "cash_compensation": cash_compensation,
+                "fraction_cash": fraction_cash or 0.0,
+                "cost_after": cost_after,
+                "cost_per_share_before": (
+                    round(cost / quantity, 6) if quantity else None),
+                "cost_per_share_after": per_share_after,
+            },
+            "undetermined": undetermined,
+            # 代码变化本身不是数量变更；换股后的价格跳变不是投资收益。
+            "return_interpretation": (
+                "corporate-action-not-investment-return"
+                if action.kind == "merger" else "quantity-adjustment-not-return"
+                if action.kind == "split" else "cash-distribution-not-return"),
+        }
+
+    def plan_position_adjustment(
+        self,
+        action_id: str,
+        holding: dict,
+        known_at: str | _dt.datetime | None = None,
+    ) -> dict:
+        """按某公告版本计算持仓调整方案（不落库）。
+
+        holding 需包含 quantity 与 cost。known_at 仅用于记录方案视角；
+        公告版本由 action_id 显式指定，因此旧公告方案可随时重算。
+        """
+        action = self._get_action(action_id)
+        quantity = float(holding.get("quantity", 0.0))
+        cost = float(holding.get("cost", 0.0))
+        plan = self._plan_for_action(action, quantity, cost)
+        plan["known_at"] = _parse_dt(known_at) if known_at else None
+        plan["holding_id"] = holding.get("holding_id", "")
+        return plan
+
+    def compare_action_plans(
+        self,
+        action_id_original: str,
+        action_id_revised: str,
+        holding: dict,
+    ) -> dict:
+        """比较继续采用旧公告与改用修订公告的两套方案。
+
+        逐笔列出数量、成本分配、现金补偿与未确定部分的差异。
+        """
+        original = self.plan_position_adjustment(action_id_original, holding)
+        revised = self.plan_position_adjustment(action_id_revised, holding)
+        checks = {
+            "new_quantity": (original["new_quantity"], revised["new_quantity"]),
+            "fractional_shares": (original["fractional_shares"],
+                                  revised["fractional_shares"]),
+            "fraction_cash": (original["fraction_cash"], revised["fraction_cash"]),
+            "cash_compensation": (original["cash_compensation"],
+                                  revised["cash_compensation"]),
+            "cost_after": (original["cost_allocation"]["cost_after"],
+                           revised["cost_allocation"]["cost_after"]),
+            "cost_per_share_after": (
+                original["cost_allocation"]["cost_per_share_after"],
+                revised["cost_allocation"]["cost_per_share_after"]),
+            "new_security_id": (original["new_security_id"],
+                                revised["new_security_id"]),
+            "undetermined": (tuple(original["undetermined"]),
+                             tuple(revised["undetermined"])),
+        }
+        changed = {
+            key: {"before": before, "after": after}
+            for key, (before, after) in checks.items() if before != after
+        }
+        return {
+            "original": original,
+            "revised": revised,
+            "changed_fields": changed,
+        }
+
+    def apply_action_chain(
+        self,
+        holding: dict,
+        action_ids: list[str],
+        known_at: str | _dt.datetime | None = None,
+    ) -> dict:
+        """把连续多次公司行动依次作用到同一笔持仓，逐步列出调整。"""
+        quantity = float(holding.get("quantity", 0.0))
+        cost = float(holding.get("cost", 0.0))
+        steps = []
+        for aid in action_ids:
+            plan = self.plan_position_adjustment(
+                aid, {"quantity": quantity, "cost": cost,
+                      "holding_id": holding.get("holding_id", "")}, known_at)
+            steps.append(plan)
+            quantity = plan["new_quantity"]
+            cost = plan["cost_allocation"]["cost_after"]
+        return {
+            "holding_id": holding.get("holding_id", ""),
+            "steps": steps,
+            "final": {"quantity": quantity, "cost": cost},
+        }
+
+    def adopt_corporate_action(
+        self,
+        action_id: str,
+        holding_id: str,
+        holding_quantity: float,
+        quantity: float,
+        cost: float,
+        adopted_at: str | _dt.datetime,
+        known_at: str | _dt.datetime | None = None,
+        reason: str = "",
+    ) -> dict:
+        """用户确认采用某公告版本，落库一条持仓调整。
+
+        支持部分采用：同一 (holding_id, 修订链) 的累计采用数量不得超过
+        持仓总量，否则抛 ValueError——同一份额不能被同时计入两个证券。
+        """
+        action = self._get_action(action_id)
+        root = self._action_chain_root(
+            action_id, {a.action_id: a for a in self.corporate_actions()})
+        chain_ids = tuple(
+            a.action_id for a in self.corporate_actions()
+            if a.kind != "withdraw"
+            and self._action_chain_root(
+                a.action_id,
+                {x.action_id: x for x in self.corporate_actions()}) == root)
+        placeholders = ",".join("?" for _ in chain_ids)
+        adopted = self.conn.execute(
+            f"SELECT COALESCE(SUM(quantity), 0) FROM position_adjustment"
+            f" WHERE holding_id=? AND action_id IN ({placeholders})",
+            (holding_id, *chain_ids),
+        ).fetchone()[0]
+        if adopted + quantity > holding_quantity + 1e-9:
+            raise ValueError(
+                f"持仓 {holding_id} 在该公司行动链上已采用 {adopted} 股，"
+                f"再采用 {quantity} 股将超过持仓 {holding_quantity} 股")
+        plan = self._plan_for_action(action, quantity, cost)
+        ka = _parse_dt(known_at) if known_at else _parse_dt(adopted_at)
+        adjustment_id = f"_auto_adj_{uuid.uuid4().hex}"
+        self.conn.execute(
+            "INSERT INTO position_adjustment(adjustment_id, holding_id, action_id,"
+            " security_id, new_security_id, quantity, cost, adopted_at, known_at,"
+            " plan, reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                adjustment_id, holding_id, action.action_id, action.security_id,
+                plan["new_security_id"], quantity, cost,
+                _parse_dt(adopted_at).isoformat(), ka.isoformat(),
+                json.dumps(self._json_safe(plan), ensure_ascii=False,
+                           default=_json_default),
+                reason,
+            ),
+        )
+        self.conn.commit()
+        plan["adjustment_id"] = adjustment_id
+        plan["holding_id"] = holding_id
+        plan["known_at"] = ka
+        plan["remaining_quantity"] = round(holding_quantity - adopted - quantity, 10)
+        return plan
+
+    def holding_adjustments(
+        self,
+        holding_id: str | None = None,
+        security_id: str | None = None,
+    ) -> list[dict]:
+        """沿证券身份与公司行动追踪每一笔已落库的持仓调整。"""
+        sql = ("SELECT * FROM position_adjustment WHERE 1=1")
+        params: list = []
+        if holding_id is not None:
+            sql += " AND holding_id=?"
+            params.append(holding_id)
+        if security_id is not None:
+            sql += " AND (security_id=? OR new_security_id=?)"
+            params += [security_id, security_id]
+        sql += " ORDER BY seq"
+        out = []
+        for row in self.conn.execute(sql, params):
+            plan = json.loads(row["plan"])
+            out.append({
+                "adjustment_id": row["adjustment_id"],
+                "holding_id": row["holding_id"],
+                "action_id": row["action_id"],
+                "security_id": row["security_id"],
+                "new_security_id": row["new_security_id"],
+                "quantity": row["quantity"],
+                "cost": row["cost"],
+                "adopted_at": _parse_dt(row["adopted_at"]),
+                "known_at": _parse_dt(row["known_at"]),
+                "reason": row["reason"],
+                "plan": plan,
+            })
+        return out
 
     # ---------- 行情写入 ----------
 
@@ -1496,7 +1903,8 @@ class Dataset:
         for table in ("security", "trading_session", "corp_split",
                       "quote_event", "adjudication", "priority_rule",
                       "identity_announcement", "code_quote_event",
-                      "saved_research"):
+                      "saved_research", "corporate_action",
+                      "position_adjustment"):
             counts[table] = self.conn.execute(
                 f"SELECT COUNT(*) FROM {table}"
             ).fetchone()[0]
