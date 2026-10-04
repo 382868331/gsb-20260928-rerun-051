@@ -8,6 +8,9 @@
 >
 > 第四轮新增：**证券身份公告、显示代码复用/跨市场转板、映射撤回、组合身份调整对照**
 > （`examples/demo_identity.py`，`tests/test_identity_portfolio.py`）。
+>
+> 第五轮新增：**拆股、换股合并、现金补偿的版本化公司行动账本**
+> （`tests/test_corporate_actions.py`）。
 
 纯 Python 标准库 + SQLite，离线运行，不联网下载任何行情。核心解决一个问题：
 **回测站在某个历史时点，只能看到当时实际已经收到的数据；后来补齐的价格、迟到的修订、事后才公告的拆分因子都不能被提前使用。**
@@ -26,6 +29,8 @@
 - `histquote/identity.py`：证券身份 `Security`；拆分 `Split`（除权日 + 因子 + 收到时间）。
 - `histquote/identity.py`：`IdentityAnnouncement`（确认/候选/改名/撤回）与
   `IdentityResolution`（查询采用的身份、公告和来源规则）。
+- `histquote/identity.py`：`CorporateAction`（预告/修订/撤回、拆股/换股、现金补偿、
+  零碎份额去向）与 `HoldingLot`（逐笔持仓、数量和成本）。
 - `histquote/calendar.py`：交易日历，区分开市日与非交易日。
 - `histquote/quote.py`：`Quote`、稳定证券事件 `QuoteEvent`、显示代码事件
   `CodeQuoteEvent`、`QuoteStatus`。
@@ -124,6 +129,25 @@
 - `save_portfolio_research()` 保存持仓、研究时点、`identity_as_of` 和当时结果；
   后续代码重分配、公告迟到或撤回后，`reopen_saved_research()` 仍按当时身份解释。
 
+## 公司行动与持仓调整
+
+- `add_corporate_action()` 只追加 `preview` / `revision` / `withdrawal`；同一行动族用
+  `family_id` 串联，撤回精确指向 `target_action_id`，不覆盖预告或旧修订。
+- `apply_corporate_actions()` 以 `business_date` 和 `known_at` 重放当时可见资料；
+  预告默认不采用，显式选择或 `include_previews=True` 时可用于方案测算。
+- `compare_corporate_action_scenarios()` 可继续采用旧公告，也可改用修订公告，逐笔列出
+  输入数量、新证券数量、成本分配、现金补偿、零碎份额和未确定部分。
+- 拆股保持同一 `security_id`，仅新增调整批次；换股合并才产生新 `security_id`。
+  显示代码变化本身不是数量变化，换股后的新旧价格跳变不记为投资收益。
+- 现金补偿和零碎股份现金分别列示；`cash_cost_portion` 指出现金承担的原成本，
+  剩余成本分配给新证券。零碎份额作价或去向未知时进入 `undetermined`。
+- 新证券身份未确认时保留 `candidate_security_ids`，不自动猜测为任何现有证券。
+- 部分采用按批次扣减，剩余原证券和取得证券分开保存；同一来源份额不会同时留在
+  两个证券中。连续公司行动沿 `lineage` 串联，原 `HoldingLot`、报价和行动均不覆盖。
+- `save_corporate_action_research()` 保存研究视角、采用决策和调整结果；行动后来修订
+  或撤回后，`reopen_corporate_action_research()` 仍按保存时的可见公告重放，并用
+  `corporate_action_adjustments()` 逐笔追溯来源行动。
+
 ## 快速开始
 
 ```bash
@@ -131,6 +155,7 @@
 .venv/bin/python -m examples.demo_conflict
 .venv/bin/python -m examples.demo_priority_rules
 .venv/bin/python -m examples.demo_identity
+.venv/bin/python -m unittest tests.test_corporate_actions
 .venv/bin/python -m unittest discover -s tests
 ```
 

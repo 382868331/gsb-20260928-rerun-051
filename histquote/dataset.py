@@ -19,12 +19,15 @@ from pathlib import Path
 
 from .calendar import TradingCalendar
 from .adjudication import Adjudication
-from .identity import IdentityAnnouncement, IdentityResolution, Security, Split
+from .identity import (
+    CorporateAction, HoldingLot, IdentityAnnouncement, IdentityResolution,
+    Security, Split,
+)
 from .priority import PriorityRule
 from .query import QuoteView, SourceCandidate
 from .quote import CodeQuoteEvent, Quote, QuoteEvent, QuoteStatus
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _parse_dt(value: str | _dt.datetime) -> _dt.datetime:
@@ -70,6 +73,44 @@ CREATE TABLE IF NOT EXISTS corp_split(
     ratio REAL NOT NULL,
     received_at TEXT NOT NULL,
     PRIMARY KEY (security_id, ex_date, received_at)
+);
+CREATE TABLE IF NOT EXISTS corp_action(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    action_id TEXT NOT NULL UNIQUE,
+    family_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    effective_date TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    from_security_id TEXT NOT NULL DEFAULT '',
+    to_security_id TEXT NOT NULL DEFAULT '',
+    from_ratio REAL NOT NULL,
+    to_ratio REAL NOT NULL,
+    cash_per_from_share REAL NOT NULL DEFAULT 0,
+    cash_cost_portion REAL NOT NULL DEFAULT 0,
+    fractional_cash_rate TEXT NOT NULL DEFAULT '',
+    fractional_destination TEXT NOT NULL DEFAULT 'cash',
+    announcement_kind TEXT NOT NULL,
+    confirmation_status TEXT NOT NULL DEFAULT 'confirmed',
+    source TEXT NOT NULL DEFAULT '',
+    source_record TEXT NOT NULL DEFAULT '',
+    supersedes TEXT NOT NULL DEFAULT '',
+    target_action_id TEXT NOT NULL DEFAULT '',
+    candidate_security_ids TEXT NOT NULL DEFAULT '[]',
+    reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_corp_action_asof
+    ON corp_action(family_id, effective_date, received_at, seq);
+CREATE TABLE IF NOT EXISTS corp_action_adoption(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    research_id TEXT NOT NULL,
+    action_id TEXT NOT NULL,
+    adopted_at TEXT NOT NULL,
+    known_at TEXT NOT NULL,
+    selected_lots TEXT NOT NULL DEFAULT '{}',
+    source TEXT NOT NULL DEFAULT '',
+    source_record TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    UNIQUE(research_id, action_id)
 );
 CREATE TABLE IF NOT EXISTS quote_event(
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,7 +191,8 @@ CREATE TABLE IF NOT EXISTS saved_research(
     business_date TEXT NOT NULL,
     known_at TEXT NOT NULL,
     identity_as_of TEXT NOT NULL DEFAULT '',
-    payload TEXT NOT NULL
+    payload TEXT NOT NULL,
+    research_kind TEXT NOT NULL DEFAULT 'portfolio'
 );
 """
 
@@ -158,6 +200,12 @@ _EXTRA_COLUMNS = {
     "quote_event": {
         "target_source": "TEXT NOT NULL DEFAULT ''",
         "target_record": "TEXT NOT NULL DEFAULT ''",
+    },
+    "saved_research": {
+        "research_kind": "TEXT NOT NULL DEFAULT 'portfolio'",
+    },
+    "corp_action": {
+        "cash_cost_portion": "REAL NOT NULL DEFAULT 0",
     },
 }
 
@@ -495,6 +543,9 @@ class Dataset:
         )
 
     def add_split(self, split: Split) -> None:
+        action_id = (
+            f"split:{split.security_id}:{split.ex_date.isoformat()}"
+        )
         self.conn.execute(
             "INSERT OR IGNORE INTO corp_split(security_id, ex_date, ratio, received_at)"
             " VALUES (?,?,?,?)",
@@ -505,7 +556,618 @@ class Dataset:
                 split.received_at.isoformat(),
             ),
         )
+        self.add_corporate_action(CorporateAction(
+            action_id=action_id,
+            family_id=action_id,
+            action_type="split",
+            effective_date=split.ex_date,
+            received_at=split.received_at,
+            from_security_id=split.security_id,
+            to_security_id=split.security_id,
+            from_ratio=1.0,
+            to_ratio=split.ratio,
+            announcement_kind="revision",
+        ))
         self.conn.commit()
+
+    # ---------- 公司行动（版本化公告 + 采用决策） ----------
+
+    def add_corporate_action(
+        self, action: CorporateAction
+    ) -> tuple[bool, int | None]:
+        """追加预告、修订或撤回；同一来源记录重放幂等，冲突时报错。"""
+        row = self.conn.execute(
+            "SELECT seq, action_type, effective_date, received_at, from_security_id,"
+            " to_security_id, from_ratio, to_ratio, cash_per_from_share,"
+            " cash_cost_portion, fractional_cash_rate, fractional_destination,"
+            " announcement_kind, confirmation_status, source, source_record,"
+            " supersedes, target_action_id, candidate_security_ids, reason"
+            " FROM corp_action WHERE action_id=?",
+            (action.action_id,),
+        ).fetchone()
+        if row is not None:
+            if self._corp_action_content_tuple(action) != tuple(row)[1:]:
+                raise ValueError(
+                    f"公司行动 {action.action_id} 已存在且内容不同，禁止覆盖"
+                )
+            return False, row["seq"]
+        if action.source and action.source_record:
+            dup = self.conn.execute(
+                "SELECT seq FROM corp_action WHERE source=? AND source_record=?",
+                (action.source, action.source_record),
+            ).fetchone()
+            if dup is not None:
+                return False, dup["seq"]
+        cur = self.conn.execute(
+            "INSERT INTO corp_action(action_id, family_id, action_type, effective_date,"
+            " received_at, from_security_id, to_security_id, from_ratio, to_ratio,"
+            " cash_per_from_share, cash_cost_portion, fractional_cash_rate,"
+            " fractional_destination, announcement_kind, confirmation_status,"
+            " source, source_record, supersedes, target_action_id,"
+            " candidate_security_ids, reason)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            self._corp_action_insert_tuple(action),
+        )
+        self.conn.commit()
+        return True, cur.lastrowid
+
+    @staticmethod
+    def _corp_action_content_tuple(action: CorporateAction) -> tuple:
+        return (
+            action.action_type, action.effective_date.isoformat(),
+            action.received_at.isoformat(), action.from_security_id,
+            action.to_security_id, action.from_ratio, action.to_ratio,
+            action.cash_per_from_share, action.cash_cost_portion,
+            "" if action.fractional_cash_rate is None else str(action.fractional_cash_rate),
+            action.fractional_destination, action.announcement_kind,
+            action.confirmation_status, action.source, action.source_record,
+            action.supersedes, action.target_action_id,
+            json.dumps(action.candidate_security_ids, ensure_ascii=False),
+            action.reason,
+        )
+
+    def _corp_action_insert_tuple(self, action: CorporateAction) -> tuple:
+        return (
+            action.action_id or f"_auto_ca_{uuid.uuid4().hex}",
+            action.family_id or action.action_id, action.action_type,
+            action.effective_date.isoformat(), action.received_at.isoformat(),
+            action.from_security_id, action.to_security_id,
+            action.from_ratio, action.to_ratio, action.cash_per_from_share,
+            action.cash_cost_portion,
+            "" if action.fractional_cash_rate is None else str(action.fractional_cash_rate),
+            action.fractional_destination, action.announcement_kind,
+            action.confirmation_status, action.source, action.source_record,
+            action.supersedes, action.target_action_id,
+            json.dumps(list(action.candidate_security_ids), ensure_ascii=False),
+            action.reason,
+        )
+
+    def corporate_actions(
+        self, family_id: str | None = None,
+        known_at: str | _dt.datetime | None = None,
+    ) -> list[CorporateAction]:
+        sql, args = "SELECT * FROM corp_action", []
+        clauses = []
+        if family_id is not None:
+            clauses.append("family_id=?")
+            args.append(family_id)
+        if known_at is not None:
+            clauses.append("received_at <= ?")
+            args.append(_parse_dt(known_at).isoformat())
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY effective_date, received_at, seq"
+        return [self._corp_action_from_row(r)
+                for r in self.conn.execute(sql, args)]
+
+    @staticmethod
+    def _corp_action_from_row(row: sqlite3.Row) -> CorporateAction:
+        rate_text = row["fractional_cash_rate"]
+        return CorporateAction(
+            action_id=row["action_id"], family_id=row["family_id"],
+            action_type=row["action_type"],
+            effective_date=_dt.date.fromisoformat(row["effective_date"]),
+            received_at=_parse_dt(row["received_at"]),
+            from_security_id=row["from_security_id"],
+            to_security_id=row["to_security_id"],
+            from_ratio=row["from_ratio"], to_ratio=row["to_ratio"],
+            cash_per_from_share=row["cash_per_from_share"],
+            cash_cost_portion=row["cash_cost_portion"],
+            fractional_cash_rate=float(rate_text) if rate_text else None,
+            fractional_destination=row["fractional_destination"],
+            announcement_kind=row["announcement_kind"],
+            confirmation_status=row["confirmation_status"],
+            source=row["source"], source_record=row["source_record"],
+            supersedes=row["supersedes"],
+            target_action_id=row["target_action_id"],
+            candidate_security_ids=tuple(json.loads(row["candidate_security_ids"] or "[]")),
+            reason=row["reason"], sequence=row["seq"],
+        )
+
+    def corporate_action_scenario(
+        self,
+        family_id: str,
+        known_at: str | _dt.datetime,
+        action_id: str = "",
+        as_of_date: str | _dt.date | None = None,
+    ) -> dict:
+        """返回某 family 在指定视角下的公告状态；可显式选择旧公告做方案对照。"""
+        ka = _parse_dt(known_at)
+        versions = self.corporate_actions(family_id, ka)
+        if not versions:
+            return {"family_id": family_id, "status": "unknown",
+                    "action": None, "versions": (), "withdrawn_by": ""}
+        withdrawn_targets = {
+            a.target_action_id: a for a in versions if a.announcement_kind == "withdrawal"
+        }
+        substantive = [a for a in versions if a.announcement_kind != "withdrawal"]
+        if action_id:
+            chosen = next((a for a in substantive if a.action_id == action_id), None)
+            if chosen is None:
+                raise ValueError(f"指定视角下不可见公司行动: {action_id}")
+            if as_of_date is not None and chosen.effective_date > _dt.date.fromisoformat(
+                    str(as_of_date)):
+                return {"family_id": family_id, "status": "not-effective",
+                        "action": chosen, "versions": tuple(versions),
+                        "withdrawn_by": ""}
+            withdrawal = withdrawn_targets.get(chosen.action_id)
+            return {
+                "family_id": family_id,
+                "status": "withdrawn" if withdrawal else "selected",
+                "action": chosen, "versions": tuple(versions),
+                "withdrawn_by": withdrawal.action_id if withdrawal else "",
+            }
+        visible = [a for a in substantive
+                   if as_of_date is None or a.effective_date <= _dt.date.fromisoformat(str(as_of_date))]
+        if not visible:
+            return {"family_id": family_id, "status": "not-effective",
+                    "action": None, "versions": tuple(versions), "withdrawn_by": ""}
+        chosen = max(visible, key=lambda a: (a.received_at, a.sequence))
+        withdrawal = withdrawn_targets.get(chosen.action_id)
+        return {
+            "family_id": family_id,
+            "status": "withdrawn" if withdrawal
+            else ("preview" if chosen.announcement_kind == "preview" else "active"),
+            "action": chosen if not withdrawal else None,
+            "versions": tuple(versions),
+            "withdrawn_by": withdrawal.action_id if withdrawal else "",
+        }
+
+    @staticmethod
+    def _holding_lot(item, index: int) -> dict:
+        if isinstance(item, HoldingLot):
+            lot = item
+        elif isinstance(item, dict):
+            lot = HoldingLot(
+                lot_id=str(item.get("lot_id") or item.get("transaction_id")
+                             or f"lot-{index}"),
+                security_id=item.get("security_id", ""),
+                quantity=float(item.get("quantity", item.get("shares", 0))),
+                cost=float(item.get("cost", item.get("cost_basis", 0))),
+                trade_date=item.get("trade_date"),
+                display_code=item.get("display_code", item.get("code", "")),
+                market=item.get("market", ""),
+                source=item.get("source", ""),
+                source_record=item.get("source_record", ""),
+            )
+        else:
+            raise TypeError("持仓必须是 HoldingLot 或 dict")
+        return dataclasses.asdict(lot)
+
+    def apply_corporate_actions(
+        self,
+        holdings,
+        business_date: str | _dt.date,
+        known_at: str | _dt.datetime,
+        selected_action_ids: dict[str, str] | list[str] | tuple[str, ...] | None = None,
+        selected_quantities: dict[str, float] | None = None,
+        include_previews: bool = False,
+        research_id: str = "",
+        adopted_at: str | _dt.datetime | None = None,
+        persist_adoption: bool = False,
+        allow_withdrawn: bool = False,
+    ) -> dict:
+        """按当时可见行动重放持仓；显式选择旧/修订公告时可做方案对照。"""
+        bd = business_date if isinstance(business_date, _dt.date) else _dt.date.fromisoformat(business_date)
+        ka = _parse_dt(known_at)
+        selected_quantities = selected_quantities or {}
+        lots = [self._holding_lot(h, i) for i, h in enumerate(holdings)]
+        for lot in lots:
+            lot.update({
+                "remaining_quantity": lot["quantity"],
+                "remaining_cost": lot["cost"],
+                "lineage": [lot["lot_id"]],
+                "origin_lot_id": lot["lot_id"],
+                "created_by_action_id": "",
+                "selection_locked_family": "",
+            })
+        adjustments: list[dict] = []
+        undetermined: list[dict] = []
+
+        wanted = self._selected_action_map(selected_action_ids)
+        actions = self._actions_for_application(
+            bd, ka, wanted, include_previews
+        )
+        explicit = bool(wanted)
+        if explicit and any(s["status"] == "withdrawn" for s in actions):
+            withdrawn = next(s for s in actions if s["status"] == "withdrawn")
+            if not allow_withdrawn:
+                raise ValueError(
+                    f"公司行动已撤回，不能作为新决策采用: {withdrawn['action'].action_id}"
+                )
+        for scenario in actions:
+            action = scenario["action"]
+            current = [lot for lot in lots
+                       if lot["security_id"] == action.from_security_id
+                       and lot["remaining_quantity"] > 0]
+            for lot in current:
+                if (lot.get("selection_locked_family")
+                        and lot["selection_locked_family"] != action.family_id):
+                    continue
+                available = lot["remaining_quantity"]
+                requested = self._selected_quantity(
+                    selected_quantities, action, lot, available)
+                chosen_qty = max(0.0, min(float(requested), available))
+                if chosen_qty <= 0:
+                    continue
+                action_selection = selected_quantities.get(action.action_id)
+                family_selection = selected_quantities.get(action.family_id)
+                explicit_selection = (
+                    isinstance(action_selection, dict)
+                    and lot["lot_id"] in action_selection
+                ) or (
+                    isinstance(family_selection, dict)
+                    and lot["lot_id"] in family_selection
+                )
+                if explicit_selection and chosen_qty < available:
+                    lot["selection_locked_family"] = action.family_id
+                if action.confirmation_status == "candidate":
+                    undetermined.append({
+                        "lot_id": lot["lot_id"],
+                        "security_id": action.from_security_id,
+                        "quantity": chosen_qty,
+                        "cost": lot["remaining_cost"] * chosen_qty / available,
+                        "action_id": action.action_id,
+                        "family_id": action.family_id,
+                        "candidate_security_ids": action.candidate_security_ids,
+                        "reason": "公司行动新证券身份未确认，不猜测现有证券",
+                    })
+                    continue
+                adjustment = self._apply_one_action(lot, action, chosen_qty, available)
+                if adjustment.get("fraction_undetermined"):
+                    undetermined.append(adjustment["fraction_undetermined"])
+                lot["remaining_quantity"] = round(available - chosen_qty, 12)
+                lot["remaining_cost"] = round(
+                    lot["remaining_cost"] - adjustment["consumed_cost"], 12
+                )
+                if adjustment["output_lot"] is not None:
+                    lots.append(adjustment["output_lot"])
+                adjustments.append(adjustment)
+
+        positions = self._corporate_action_positions(lots)
+        cash_items = [a["cash"] for a in adjustments if a["cash"]]
+        result = {
+            "business_date": bd,
+            "known_at": ka,
+            "action_ids": tuple(a["action"].action_id for a in actions),
+            "actions": tuple(a["action"] for a in actions),
+            "original_lots": tuple(self._holding_lot(h, i)
+                                    for i, h in enumerate(holdings)),
+            "lots": tuple(lots),
+            "positions": positions,
+            "adjustments": tuple(adjustments),
+            "cash_compensations": tuple(cash_items),
+            "cash_total": round(sum(i["amount"] for i in cash_items), 6),
+            "undetermined": tuple(undetermined),
+            "investment_gain_total": 0.0,
+            "investment_gain_note": "代码变化、换股和公司行动价格跳变均不确认为投资收益",
+        }
+        if persist_adoption:
+            if not research_id:
+                raise ValueError("持久化采用决策必须提供 research_id")
+            self._save_corporate_adoption(
+                research_id, actions, selected_quantities, ka,
+                adopted_at or ka,
+            )
+        return result
+
+    @staticmethod
+    def _selected_action_map(selected) -> dict[str, str]:
+        if selected is None:
+            return {}
+        if isinstance(selected, dict):
+            return dict(selected)
+        return {"": list(selected)}
+
+    def _actions_for_application(self, bd, ka, wanted, include_previews):
+        if wanted and any(isinstance(v, (list, tuple)) for v in wanted.values()):
+            ids = next(v for v in wanted.values() if isinstance(v, (list, tuple)))
+            scenarios = []
+            for aid in ids:
+                row = self.conn.execute(
+                    "SELECT family_id FROM corp_action"
+                    " WHERE action_id=? AND received_at <= ?",
+                    (aid, ka.isoformat()),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"指定视角下不可见公司行动: {aid}")
+                scenarios.append(self.corporate_action_scenario(
+                    row["family_id"], ka, aid, bd))
+        elif wanted:
+            scenarios = [self.corporate_action_scenario(family, ka, aid, bd)
+                         for family, aid in wanted.items()]
+        else:
+            visible = self.conn.execute(
+                "SELECT DISTINCT family_id FROM corp_action"
+                " WHERE received_at <= ? AND effective_date <= ? ORDER BY family_id",
+                (ka.isoformat(), bd.isoformat()),
+            )
+            scenarios = []
+            for row in visible:
+                scenario = self.corporate_action_scenario(row[0], ka, "", bd)
+                if scenario["action"] and (
+                        include_previews
+                        or scenario["status"] == "active"):
+                    scenarios.append(scenario)
+        return sorted(scenarios, key=lambda s: (
+            s["action"].effective_date, s["action"].received_at,
+            s["action"].sequence,
+        ))
+
+    @staticmethod
+    def _selected_quantity(selected, action, lot, available):
+        if action.action_id in selected:
+            action_selection = selected[action.action_id]
+            if isinstance(action_selection, dict):
+                return float(action_selection.get(lot["lot_id"], 0.0))
+        if action.family_id in selected:
+            family_selection = selected[action.family_id]
+            if isinstance(family_selection, dict):
+                return float(family_selection.get(lot["lot_id"], 0.0))
+        return float(selected.get(lot["lot_id"], available))
+
+    def _apply_one_action(self, lot, action, chosen_qty, available):
+        consumed_cost = round(lot["remaining_cost"] * chosen_qty / available, 12)
+        gross_new = chosen_qty * action.to_ratio / action.from_ratio
+        whole = int(gross_new)
+        fraction = round(gross_new - whole, 12)
+        cash_comp = action.cash_per_from_share * chosen_qty
+        cash_cost = consumed_cost * action.cash_cost_portion
+        security_cost = consumed_cost - cash_cost
+        fraction_cash = 0.0
+        fraction_cost = 0.0
+        fraction_status = "none" if fraction == 0 else action.fractional_destination
+        output_qty = float(whole)
+        if fraction > 0:
+            fraction_cost = security_cost * fraction / gross_new
+            if action.fractional_destination == "cash":
+                rate = action.fractional_cash_rate
+                if rate is None:
+                    fraction_status = "undetermined"
+                else:
+                    fraction_cash = fraction * rate
+                    cash_cost += fraction_cost
+                    security_cost -= fraction_cost
+            elif action.fractional_destination == "retain":
+                output_qty = gross_new
+                fraction_cost = 0.0
+            else:
+                fraction_status = "undetermined"
+        target_id = action.from_security_id if action.action_type == "split" else action.to_security_id
+        fraction_undetermined = None
+        if fraction > 0 and fraction_status == "undetermined":
+            fraction_undetermined = {
+                "lot_id": lot["lot_id"],
+                "security_id": "",
+                "quantity": fraction,
+                "cost": fraction_cost,
+                "action_id": action.action_id,
+                "family_id": action.family_id,
+                "candidate_security_ids": (),
+                "reason": "零碎份额去向或作价未确定",
+            }
+            security_cost -= fraction_cost
+        output = None
+        if output_qty > 0 and target_id:
+            output = {
+                "lot_id": f"{lot['lot_id']}:{action.action_id}",
+                "security_id": target_id,
+                "quantity": round(output_qty, 12),
+                "cost": round(security_cost if fraction_status != "retain"
+                               else consumed_cost - cash_cost, 12),
+                "remaining_quantity": round(output_qty, 12),
+                "remaining_cost": round(security_cost if fraction_status != "retain"
+                                         else consumed_cost - cash_cost, 12),
+                "trade_date": action.effective_date.isoformat(),
+                "display_code": "", "market": "",
+                "source": action.source, "source_record": action.source_record,
+                "lineage": lot["lineage"] + [action.action_id,
+                                              f"{lot['lot_id']}:{action.action_id}"],
+                "origin_lot_id": lot["origin_lot_id"],
+                "created_by_action_id": action.action_id,
+                "selection_locked_family": "",
+            }
+        cash = None
+        if cash_comp > 0 or fraction_cash > 0:
+            cash = {
+                "source_lot_id": lot["lot_id"],
+                "action_id": action.action_id,
+                "family_id": action.family_id,
+                "compensation": round(cash_comp, 6),
+                "fractional_cash": round(fraction_cash, 6),
+                "amount": round(cash_comp + fraction_cash, 6),
+                "allocated_cost": round(cash_cost, 6),
+                "investment_gain": None,
+            }
+        return {
+            "action_id": action.action_id,
+            "family_id": action.family_id,
+            "action_type": action.action_type,
+            "source_lot_id": lot["lot_id"],
+            "source_security_id": action.from_security_id,
+            "output_security_id": target_id,
+            "input_quantity": round(chosen_qty, 12),
+            "gross_new_quantity": round(gross_new, 12),
+            "whole_quantity": output_qty,
+            "fractional_quantity": fraction,
+            "fractional_destination": fraction_status,
+            "consumed_cost": consumed_cost,
+            "new_security_cost": round(security_cost if fraction_status != "retain"
+                                      else consumed_cost, 6),
+            "output_lot": output,
+            "cash": cash,
+            "lineage": lot["lineage"] + [action.action_id],
+            "code_change_is_quantity_change": False,
+            "investment_gain": None,
+            "fraction_undetermined": fraction_undetermined,
+        }
+
+    @staticmethod
+    def _corporate_action_positions(lots):
+        grouped = {}
+        for lot in lots:
+            qty = lot["remaining_quantity"]
+            if qty <= 0:
+                continue
+            item = grouped.setdefault(lot["security_id"], {
+                "security_id": lot["security_id"], "quantity": 0.0,
+                "cost": 0.0, "lot_ids": []
+            })
+            item["quantity"] += qty
+            item["cost"] += lot["remaining_cost"]
+            item["lot_ids"].append(lot["lot_id"])
+        return tuple(dict(item, quantity=round(item["quantity"], 8),
+                          cost=round(item["cost"], 8))
+                     for item in sorted(grouped.values(),
+                                       key=lambda x: x["security_id"]))
+
+    def _save_corporate_adoption(self, research_id, scenarios, selected_lots,
+                                 known_at, adopted_at):
+        for scenario in scenarios:
+            action = scenario["action"]
+            self.conn.execute(
+                "INSERT OR IGNORE INTO corp_action_adoption(research_id, action_id,"
+                " adopted_at, known_at, selected_lots, source, source_record, note)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (research_id, action.action_id, adopted_at.isoformat(),
+                 known_at.isoformat(), json.dumps(selected_lots),
+                 action.source, action.source_record, scenario["status"]),
+            )
+        self.conn.commit()
+
+    def compare_corporate_action_scenarios(
+        self,
+        holdings,
+        business_date,
+        known_at,
+        family_id: str,
+        old_action_id: str,
+        revised_action_id: str,
+        selected_quantities: dict[str, float] | None = None,
+    ) -> dict:
+        return {
+            "original": self.apply_corporate_actions(
+                holdings, business_date, known_at,
+                selected_action_ids={family_id: old_action_id},
+                selected_quantities=selected_quantities,
+                allow_withdrawn=True),
+            "revised": self.apply_corporate_actions(
+                holdings, business_date, known_at,
+                selected_action_ids={family_id: revised_action_id},
+                selected_quantities=selected_quantities,
+                allow_withdrawn=True),
+        }
+
+    def save_corporate_action_research(
+        self,
+        research_id: str,
+        holdings,
+        business_date,
+        known_at,
+        saved_at,
+        selected_action_ids=None,
+        selected_quantities: dict[str, float] | None = None,
+        include_previews: bool = False,
+    ) -> dict:
+        result = self.apply_corporate_actions(
+            holdings, business_date, known_at, selected_action_ids,
+            selected_quantities, include_previews, research_id=research_id,
+            adopted_at=saved_at, persist_adoption=True,
+        )
+        payload = {
+            "research_id": research_id,
+            "holdings": [self._holding_lot(h, i) for i, h in enumerate(holdings)],
+            "selected_action_ids": self._json_safe(selected_action_ids or {}),
+            "selected_quantities": selected_quantities or {},
+            "include_previews": include_previews,
+            "result": self._json_safe(result),
+        }
+        self.conn.execute(
+            "INSERT INTO saved_research(research_id, saved_at, business_date,"
+            " known_at, identity_as_of, payload, research_kind)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (research_id, _parse_dt(saved_at).isoformat(),
+             result["business_date"].isoformat(), result["known_at"].isoformat(),
+             result["known_at"].isoformat(),
+             json.dumps(payload, ensure_ascii=False, default=_json_default),
+             "corporate_action"),
+        )
+        self.conn.commit()
+        return result
+
+    def corporate_action_adoptions(self, research_id: str) -> tuple[dict, ...]:
+        rows = self.conn.execute(
+            "SELECT * FROM corp_action_adoption WHERE research_id=? ORDER BY seq",
+            (research_id,),
+        )
+        return tuple({
+            "research_id": r["research_id"],
+            "action_id": r["action_id"],
+            "adopted_at": _parse_dt(r["adopted_at"]),
+            "known_at": _parse_dt(r["known_at"]),
+            "selected_lots": json.loads(r["selected_lots"]),
+            "source": r["source"],
+            "source_record": r["source_record"],
+            "status": r["note"],
+        } for r in rows)
+
+    def corporate_action_adjustments(self, research_id: str) -> tuple[dict, ...]:
+        saved = self.saved_research(research_id)
+        return tuple(saved["result"].get("adjustments", ()))
+
+    def reopen_corporate_action_research(self, research_id: str) -> dict:
+        saved = self.saved_research(research_id)
+        if saved.get("research_kind") != "corporate_action" and "selected_action_ids" not in saved:
+            raise ValueError(f"不是公司行动研究: {research_id}")
+        reopened = self.apply_corporate_actions(
+            [HoldingLot(**lot) for lot in saved["holdings"]],
+            saved["business_date"], saved["known_at"],
+            saved.get("selected_action_ids"),
+            saved.get("selected_quantities"),
+            saved.get("include_previews", False),
+            allow_withdrawn=True,
+        )
+        old = saved["result"]
+        return {
+            "saved": saved,
+            "reopened": reopened,
+            "same_positions": tuple(old["positions"]) == reopened["positions"],
+            "same_adjustments": self._adjustment_signatures(old)
+            == self._adjustment_signatures(reopened),
+            "same_cash_total": old["cash_total"] == reopened["cash_total"],
+            "same_undetermined": tuple(old["undetermined"]) == reopened["undetermined"],
+            "adoptions": self.corporate_action_adoptions(research_id),
+        }
+
+    @staticmethod
+    def _adjustment_signatures(result) -> tuple:
+        return tuple(
+            (a["action_id"], a["source_lot_id"], a["input_quantity"],
+             a["output_security_id"], a["whole_quantity"],
+             a["fractional_quantity"], a["fractional_destination"],
+             a["consumed_cost"], a["new_security_cost"], tuple(a["lineage"]))
+            for a in result.get("adjustments", ())
+        )
 
     # ---------- 行情写入 ----------
 
@@ -1189,6 +1851,7 @@ class Dataset:
         payload["business_date"] = _dt.date.fromisoformat(row["business_date"])
         payload["known_at"] = _parse_dt(row["known_at"])
         payload["identity_as_of"] = _parse_dt(row["identity_as_of"])
+        payload["research_kind"] = row["research_kind"]
         return payload
 
     def reopen_saved_research(self, research_id: str) -> dict:
@@ -1215,6 +1878,8 @@ class Dataset:
             return [cls._json_safe(v) for v in value]
         if hasattr(value, "as_dict"):
             return value.as_dict()
+        if dataclasses.is_dataclass(value):
+            return dataclasses.asdict(value)
         if isinstance(value, _dt.datetime):
             return value.isoformat()
         if isinstance(value, _dt.date):
@@ -1327,6 +1992,19 @@ class Dataset:
                 "received_at": _parse_dt(r["received_at"]),
                 "source": "", "source_record": "",
             })
+        for r in self.conn.execute(
+            "SELECT * FROM corp_action WHERE effective_date <= ?"
+            " AND received_at > ? AND received_at <= ? ORDER BY received_at, seq",
+            (bd.isoformat(), s.isoformat(), e.isoformat()),
+        ):
+            events.append({
+                "type": "corporate_action", "kind": r["action_type"],
+                "action_id": r["action_id"], "family_id": r["family_id"],
+                "announcement_kind": r["announcement_kind"],
+                "received_at": _parse_dt(r["received_at"]),
+                "effective_date": _dt.date.fromisoformat(r["effective_date"]),
+                "source": r["source"], "source_record": r["source_record"],
+            })
         return sorted(events, key=lambda x: x["received_at"])
 
     def explain_viewpoint_diff(
@@ -1401,6 +2079,23 @@ class Dataset:
                 "ratio": r["ratio"],
                 "received_at": _parse_dt(r["received_at"]),
                 "source": "", "source_record": "",
+            })
+        for r in self.conn.execute(
+            "SELECT * FROM corp_action"
+            " WHERE effective_date <= ? AND received_at <= ? ORDER BY received_at, seq",
+            (bd.isoformat(), end),
+        ):
+            items.append({
+                "type": "corporate_action", "kind": r["action_type"],
+                "action_id": r["action_id"], "family_id": r["family_id"],
+                "announcement_kind": r["announcement_kind"],
+                "confirmation_status": r["confirmation_status"],
+                "from_security_id": r["from_security_id"],
+                "to_security_id": r["to_security_id"],
+                "ratio": [r["from_ratio"], r["to_ratio"]],
+                "effective_date": _dt.date.fromisoformat(r["effective_date"]),
+                "received_at": _parse_dt(r["received_at"]),
+                "source": r["source"], "source_record": r["source_record"],
             })
         for r in self.conn.execute(
             "SELECT * FROM priority_rule WHERE received_at != ''"
@@ -1494,9 +2189,9 @@ class Dataset:
         """数据集指纹，保存后重开应保持一致。"""
         counts = {}
         for table in ("security", "trading_session", "corp_split",
-                      "quote_event", "adjudication", "priority_rule",
-                      "identity_announcement", "code_quote_event",
-                      "saved_research"):
+                      "corp_action", "corp_action_adoption", "quote_event",
+                      "adjudication", "priority_rule", "identity_announcement",
+                      "code_quote_event", "saved_research"):
             counts[table] = self.conn.execute(
                 f"SELECT COUNT(*) FROM {table}"
             ).fetchone()[0]

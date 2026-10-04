@@ -30,6 +30,84 @@ class Split:
 
 
 @dataclasses.dataclass(frozen=True)
+class CorporateAction:
+    """版本化公司行动公告。
+
+    announcement_kind: preview / revision / withdrawal
+    action_type: split / exchange
+    from_ratio 份原证券可取得 to_ratio 份新证券；拆股时新证券仍是原证券。
+    """
+
+    action_id: str
+    family_id: str
+    action_type: str
+    effective_date: _dt.date
+    received_at: _dt.datetime
+    from_security_id: str = ""
+    to_security_id: str = ""
+    from_ratio: float = 1.0
+    to_ratio: float = 1.0
+    cash_per_from_share: float = 0.0
+    cash_cost_portion: float = 0.0
+    fractional_cash_rate: float | None = None
+    fractional_destination: str = "cash"  # cash / retain / undetermined
+    announcement_kind: str = "preview"
+    confirmation_status: str = "confirmed"  # confirmed / candidate
+    source: str = ""
+    source_record: str = ""
+    supersedes: str = ""
+    target_action_id: str = ""
+    candidate_security_ids: tuple[str, ...] = ()
+    reason: str = ""
+    sequence: int = 0
+
+    def __post_init__(self) -> None:
+        if self.action_type not in {"split", "exchange"}:
+            raise ValueError(f"未知公司行动类型: {self.action_type}")
+        if self.announcement_kind not in {"preview", "revision", "withdrawal"}:
+            raise ValueError(f"未知公司行动公告状态: {self.announcement_kind}")
+        if self.confirmation_status not in {"confirmed", "candidate"}:
+            raise ValueError(f"未知公司行动确认状态: {self.confirmation_status}")
+        if self.fractional_destination not in {"cash", "retain", "undetermined"}:
+            raise ValueError(f"未知零碎份额去向: {self.fractional_destination}")
+        if self.announcement_kind == "withdrawal":
+            if not self.target_action_id:
+                raise ValueError("公司行动撤回必须指定目标公告")
+        elif not self.from_security_id:
+            raise ValueError("公司行动必须指定原证券稳定身份")
+        if self.action_type == "exchange" and self.announcement_kind != "withdrawal":
+            if not self.to_security_id and not self.candidate_security_ids:
+                raise ValueError("换股合并必须指定新证券或保留候选身份")
+        if self.from_ratio <= 0 or self.to_ratio <= 0:
+            raise ValueError("公司行动换股比例必须为正数")
+        if self.cash_per_from_share < 0:
+            raise ValueError("现金补偿不能为负数")
+        if not 0 <= self.cash_cost_portion <= 1:
+            raise ValueError("现金补偿成本分配比例必须位于 0 到 1")
+
+
+@dataclasses.dataclass(frozen=True)
+class HoldingLot:
+    lot_id: str
+    security_id: str
+    quantity: float
+    cost: float
+    trade_date: _dt.date | None = None
+    display_code: str = ""
+    market: str = ""
+    source: str = ""
+    source_record: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.lot_id:
+            raise ValueError("持仓批次必须包含 lot_id")
+        if not self.security_id:
+            raise ValueError("持仓批次必须包含稳定证券身份")
+        if self.quantity < 0 or self.cost < 0:
+            raise ValueError("持仓数量和成本不能为负数")
+
+
+@dataclasses.dataclass(frozen=True)
 class IdentityAnnouncement:
     """显示代码与稳定证券身份之间关系的不可变公告。
 
