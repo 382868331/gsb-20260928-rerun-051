@@ -11,6 +11,7 @@ import contextlib
 import dataclasses
 import datetime as _dt
 import hashlib
+import itertools
 import json
 import os
 import sqlite3
@@ -19,6 +20,7 @@ from pathlib import Path
 
 from .calendar import TradingCalendar
 from .adjudication import Adjudication
+from .constraints import AdoptionDecision
 from .identity import (
     CorporateAction, HoldingLot, IdentityAnnouncement, IdentityResolution,
     Security, Split,
@@ -1168,6 +1170,331 @@ class Dataset:
              a["consumed_cost"], a["new_security_cost"], tuple(a["lineage"]))
             for a in result.get("adjustments", ())
         )
+
+    # ---------- 组合采用的持仓约束研究 ----------
+
+    @staticmethod
+    def _adoption_decision(item, index: int) -> dict:
+        if isinstance(item, AdoptionDecision):
+            decision = item
+        elif isinstance(item, dict):
+            decision = AdoptionDecision(**item)
+        else:
+            raise TypeError("采用决策必须是 AdoptionDecision 或 dict")
+        result = dataclasses.asdict(decision)
+        result["sequence"] = index
+        return result
+
+    def apply_adoption_constraints(
+        self,
+        holdings,
+        decisions,
+        business_date: str | _dt.date,
+        known_at: str | _dt.datetime,
+    ) -> dict:
+        """按持仓约束重放组合采用决策。
+
+        只采用显式决策的数量；同一原始份额受预算约束，不能同时支撑
+        两条互斥去向；超额采用与循环引用被阻止并列入 blocked。
+        行动按 (生效日, 收到时间, 序号) 确定顺序应用，与决策书写
+        顺序无关；前一行动派生批次可被后续决策引用。
+        """
+        bd = business_date if isinstance(business_date, _dt.date) \
+            else _dt.date.fromisoformat(business_date)
+        ka = _parse_dt(known_at)
+        lots = [self._holding_lot(h, i) for i, h in enumerate(holdings)]
+        for lot in lots:
+            lot.update({
+                "remaining_quantity": lot["quantity"],
+                "remaining_cost": lot["cost"],
+                "lineage": [lot["lot_id"]],
+                "origin_lot_id": lot["lot_id"],
+                "created_by_action_id": "",
+                "provenance": "original",
+            })
+        lot_index = {lot["lot_id"]: lot for lot in lots}
+        parsed = [self._adoption_decision(d, i) for i, d in enumerate(decisions)]
+        active = [d for d in parsed if d["status"] != "withdrawn"]
+        withdrawn = [d for d in parsed if d["status"] == "withdrawn"]
+        blocked: list[dict] = []
+
+        def block(decision, reason):
+            blocked.append({
+                "decision_id": decision["decision_id"],
+                "lot_id": decision["lot_id"],
+                "action_id": decision["action_id"],
+                "quantity": decision["quantity"],
+                "mode": decision["mode"],
+                "reason": reason,
+            })
+            decision["blocked"] = True
+
+        for decision in active:
+            decision["blocked"] = False
+
+        # 解析决策引用的公司行动（须在视角内可见且未被撤回）。
+        actions: dict[str, CorporateAction] = {}
+        for decision in active:
+            if decision["mode"] != "exchange" or decision["blocked"]:
+                continue
+            aid = decision["action_id"]
+            if aid in actions:
+                continue
+            row = self.conn.execute(
+                "SELECT family_id FROM corp_action"
+                " WHERE action_id=? AND received_at <= ?",
+                (aid, ka.isoformat()),
+            ).fetchone()
+            if row is None:
+                for d in active:
+                    if d["action_id"] == aid and not d["blocked"]:
+                        block(d, f"指定视角下不可见公司行动: {aid}")
+                continue
+            scenario = self.corporate_action_scenario(row["family_id"], ka, aid, bd)
+            if scenario["status"] == "withdrawn":
+                for d in active:
+                    if d["action_id"] == aid and not d["blocked"]:
+                        block(d, f"公司行动已撤回，不能采用: {aid}")
+                continue
+            if scenario["action"] is None:
+                for d in active:
+                    if d["action_id"] == aid and not d["blocked"]:
+                        block(d, f"公司行动在该业务日尚未生效: {aid}")
+                continue
+            actions[aid] = scenario["action"]
+
+        # 循环引用检测：被采用行动构成 原证券 -> 新证券 有向图，
+        # 成环即同一批份额可能循环支撑自身，全部阻止。
+        graph: dict[str, set[str]] = {}
+        for action in actions.values():
+            if action.action_type == "exchange" and action.to_security_id:
+                graph.setdefault(action.from_security_id, set()).add(
+                    action.to_security_id)
+        cycle_nodes: set[str] = set()
+
+        def _dfs(node, stack):
+            for nxt in graph.get(node, ()):
+                if nxt in stack:
+                    cycle_nodes.update(stack[stack.index(nxt):])
+                    cycle_nodes.add(nxt)
+                else:
+                    _dfs(nxt, stack + [nxt])
+
+        for start in graph:
+            _dfs(start, [start])
+        if cycle_nodes:
+            for decision in active:
+                action = actions.get(decision["action_id"])
+                if (action is not None and not decision["blocked"]
+                        and action.from_security_id in cycle_nodes):
+                    block(decision,
+                          "采用行动构成循环引用，同一份额不能循环支撑互斥去向")
+
+        # 原始批次预算：同一原始份额的 换股+保留+等待 合计不得超过持有量。
+        budget_used: dict[str, float] = {}
+        for decision in active:
+            if decision["blocked"]:
+                continue
+            lot = lot_index.get(decision["lot_id"])
+            if lot is None:
+                if ":" not in decision["lot_id"]:
+                    block(decision, f"未知持仓批次: {decision['lot_id']}")
+                continue
+            used = budget_used.get(lot["lot_id"], 0.0) + decision["quantity"]
+            budget_used[lot["lot_id"]] = used
+        for decision in active:
+            if decision["blocked"]:
+                continue
+            lot = lot_index.get(decision["lot_id"])
+            if lot is not None and budget_used.get(lot["lot_id"], 0.0) \
+                    > lot["quantity"] + 1e-9:
+                block(decision,
+                      f"批次 {lot['lot_id']} 采用合计 "
+                      f"{budget_used[lot['lot_id']]:g} 超过持有量 "
+                      f"{lot['quantity']:g}，超额采用被阻止")
+
+        # 按确定顺序应用换股决策；派生批次可被后续行动引用。
+        adjustments: list[dict] = []
+        retained: list[dict] = []
+        awaiting: list[dict] = []
+        ordered_actions = sorted(
+            actions.values(),
+            key=lambda a: (a.effective_date, a.received_at, a.sequence),
+        )
+        for action in ordered_actions:
+            for decision in sorted(
+                    (d for d in active
+                     if d["mode"] == "exchange" and not d["blocked"]
+                     and d["action_id"] == action.action_id),
+                    key=lambda d: d["sequence"]):
+                lot = lot_index.get(decision["lot_id"])
+                if lot is None:
+                    block(decision,
+                          f"派生批次不存在，前置行动未产生该份额: "
+                          f"{decision['lot_id']}")
+                    continue
+                if lot["security_id"] != action.from_security_id:
+                    block(decision,
+                          f"批次证券 {lot['security_id']} 与行动原证券 "
+                          f"{action.from_security_id} 不符")
+                    continue
+                available = lot["remaining_quantity"]
+                if decision["quantity"] > available + 1e-9:
+                    block(decision,
+                          f"批次 {lot['lot_id']} 可用 {available:g}，"
+                          f"决策要求 {decision['quantity']:g}，超额采用被阻止")
+                    continue
+                chosen = decision["quantity"]
+                if chosen <= 0:
+                    continue
+                if action.confirmation_status == "candidate":
+                    awaiting.append({
+                        "decision_id": decision["decision_id"],
+                        "lot_id": lot["lot_id"],
+                        "security_id": action.from_security_id,
+                        "quantity": chosen,
+                        "action_id": action.action_id,
+                        "candidate_security_ids": action.candidate_security_ids,
+                        "reason": "新证券身份未确认，份额暂挂等待核实",
+                    })
+                    continue
+                adjustment = self._apply_one_action(lot, action, chosen, available)
+                adjustment["decision_id"] = decision["decision_id"]
+                adjustment["decision_status"] = decision["status"]
+                if adjustment["cash"] is not None:
+                    adjustment["cash"]["confirmed"] = (
+                        decision["status"] == "confirmed")
+                lot["remaining_quantity"] = round(available - chosen, 12)
+                lot["remaining_cost"] = round(
+                    lot["remaining_cost"] - adjustment["consumed_cost"], 12)
+                output = adjustment["output_lot"]
+                if output is not None:
+                    output["provenance"] = (
+                        "split-proceed" if action.action_type == "split"
+                        else "exchange-proceed")
+                    existing = lot_index.get(output["lot_id"])
+                    if existing is not None:
+                        # 同一批次对同一行动的多次采用合并为同一派生批次，
+                        # 保持逐笔来源标识稳定且可追溯。
+                        for key in ("quantity", "remaining_quantity",
+                                    "cost", "remaining_cost"):
+                            existing[key] = round(
+                                existing[key] + output[key], 12)
+                    else:
+                        lots.append(output)
+                        lot_index[output["lot_id"]] = output
+                adjustments.append(adjustment)
+
+        # 保留与等待身份核实的决策：份额留在原证券，逐笔登记。
+        for decision in sorted(active, key=lambda d: d["sequence"]):
+            if decision["blocked"] or decision["mode"] == "exchange":
+                continue
+            lot = lot_index.get(decision["lot_id"])
+            if lot is None or decision["quantity"] <= 0:
+                continue
+            cost_share = (lot["remaining_cost"] * decision["quantity"]
+                          / lot["remaining_quantity"]
+                          if lot["remaining_quantity"] > 0 else 0.0)
+            entry = {
+                "decision_id": decision["decision_id"],
+                "lot_id": lot["lot_id"],
+                "security_id": lot["security_id"],
+                "quantity": decision["quantity"],
+                "cost": round(cost_share, 12),
+                "action_id": decision["action_id"],
+            }
+            if decision["mode"] == "retain":
+                entry["reason"] = "明确保留旧证券，不参与该行动"
+                retained.append(entry)
+            else:
+                entry["reason"] = decision["reason"] or "等待新证券身份核实"
+                awaiting.append(entry)
+
+        cash_items = [a["cash"] for a in adjustments if a["cash"]]
+        confirmed_cash = [c for c in cash_items if c.get("confirmed")]
+        positions = []
+        for lot in lots:
+            if lot["remaining_quantity"] <= 0:
+                continue
+            positions.append({
+                "lot_id": lot["lot_id"],
+                "security_id": lot["security_id"],
+                "quantity": round(lot["remaining_quantity"], 12),
+                "cost": round(lot["remaining_cost"], 12),
+                "origin_lot_id": lot["origin_lot_id"],
+                "created_by_action_id": lot["created_by_action_id"],
+                "provenance": lot["provenance"],
+                "lineage": list(lot["lineage"]),
+            })
+        positions.sort(key=lambda p: (p["security_id"], p["lot_id"]))
+        return {
+            "business_date": bd,
+            "known_at": ka,
+            "positions": tuple(positions),
+            "adjustments": tuple(adjustments),
+            "cash_compensations": tuple(cash_items),
+            "cash_total": round(sum(c["amount"] for c in cash_items), 6),
+            "confirmed_cash_total": round(
+                sum(c["amount"] for c in confirmed_cash), 6),
+            "pending_cash_total": round(
+                sum(c["amount"] for c in cash_items if not c.get("confirmed")), 6),
+            "retained": tuple(retained),
+            "awaiting": tuple(awaiting),
+            "blocked": tuple(blocked),
+            "withdrawn_decisions": tuple(
+                d["decision_id"] for d in withdrawn),
+            "decisions": tuple(
+                {k: v for k, v in d.items() if k != "blocked"}
+                for d in parsed),
+            "investment_gain_total": 0.0,
+            "investment_gain_note": "代码变化、换股和公司行动价格跳变均不确认为投资收益",
+        }
+
+    @staticmethod
+    def _constraint_signature(result) -> tuple:
+        return (
+            tuple((p["lot_id"], p["security_id"], p["quantity"], p["cost"],
+                   p["provenance"]) for p in result["positions"]),
+            tuple((a["decision_id"], a["action_id"], a["source_lot_id"],
+                   a["input_quantity"], a["output_security_id"],
+                   a["whole_quantity"], a["fractional_quantity"],
+                   a["consumed_cost"], a["new_security_cost"])
+                  for a in result["adjustments"]),
+            result["cash_total"],
+            tuple((b["decision_id"], b["reason"]) for b in result["blocked"]),
+        )
+
+    def compare_adoption_orders(
+        self,
+        holdings,
+        decisions,
+        business_date: str | _dt.date,
+        known_at: str | _dt.datetime,
+    ) -> dict:
+        """比较不同采用顺序是否得到一致结果。
+
+        对决策列表的全部排列逐一重放（引擎内部按行动生效日确定顺序，
+        预期完全一致）；任一排列结果不同即 consistent=False。
+        """
+        items = list(decisions)
+        signatures = {}
+        sample = None
+        for perm in itertools.permutations(items):
+            result = self.apply_adoption_constraints(
+                holdings, list(perm), business_date, known_at)
+            if sample is None:
+                sample = result
+            order = tuple(
+                (d.decision_id if isinstance(d, AdoptionDecision)
+                 else d.get("decision_id", "")) for d in perm)
+            signatures[order] = self._constraint_signature(result)
+        distinct = set(signatures.values())
+        return {
+            "consistent": len(distinct) <= 1,
+            "orderings_checked": len(signatures),
+            "distinct_results": len(distinct),
+            "result": sample,
+        }
 
     # ---------- 行情写入 ----------
 

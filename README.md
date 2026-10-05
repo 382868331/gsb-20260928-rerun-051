@@ -12,6 +12,10 @@
 > 第五轮新增：**拆股、换股合并、现金补偿的版本化公司行动账本**
 > （`tests/test_corporate_actions.py`）。
 
+> 第六轮新增：**公司行动组合采用的持仓约束研究**（部分采用/保留/等待身份核实、
+> 采用顺序一致性、循环与超额阻止、撤回重分配）
+> （`tests/test_adoption_constraints.py`）。
+
 纯 Python 标准库 + SQLite，离线运行，不联网下载任何行情。核心解决一个问题：
 **回测站在某个历史时点，只能看到当时实际已经收到的数据；后来补齐的价格、迟到的修订、事后才公告的拆分因子都不能被提前使用。**
 
@@ -148,6 +152,26 @@
   或撤回后，`reopen_corporate_action_research()` 仍按保存时的可见公告重放，并用
   `corporate_action_adjustments()` 逐笔追溯来源行动。
 
+## 组合采用的持仓约束
+
+- `AdoptionDecision` 对同一原始批次分别选择部分采用换股（exchange）、
+  保留旧证券（retain）或等待身份核实（await_identity）；决策不可变，
+  撤回以 status=withdrawn 标记，仅 pending 可撤回，已确认决策及其
+  补偿现金作为既有事实保留。
+- `apply_adoption_constraints()` 只采用显式决策数量，按行动
+  （生效日、收到时间、序号）确定顺序应用，与决策书写顺序无关；
+  前一行动派生批次（lot:action）可被后续决策引用进入后一行动。
+- 同一原始份额受预算约束：换股+保留+等待合计不得超过持有量，
+  超额采用与行动间循环引用被明确阻止并列入 `blocked`，不静默截断。
+- 新旧证券同时持有时逐笔保留来源：`provenance` 区分
+  original / split-proceed / exchange-proceed，既有新证券批次
+  绝不并入换股所得；同一批次对同一行动的多次采用合并为同一派生批次。
+- `compare_adoption_orders()` 对决策的全部排列重放并比对签名，
+  验证不同采用顺序得到一致的数量、成本与现金。
+- `withdraw_decision()` 撤回未确定决策后可重新分配剩余份额；
+  结果分列 `confirmed_cash_total` / `pending_cash_total`，
+  数量、成本与现金守恒可逐笔核对。
+
 ## 快速开始
 
 ```bash
@@ -156,6 +180,7 @@
 .venv/bin/python -m examples.demo_priority_rules
 .venv/bin/python -m examples.demo_identity
 .venv/bin/python -m unittest tests.test_corporate_actions
+.venv/bin/python -m unittest tests.test_adoption_constraints
 .venv/bin/python -m unittest discover -s tests
 ```
 

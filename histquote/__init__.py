@@ -5,6 +5,7 @@
 """
 
 from .adjudication import Adjudication
+from .constraints import AdoptionDecision, withdraw_decision
 from .dataset import Dataset
 from .identity import (
     CorporateAction, HoldingLot, IdentityAnnouncement, IdentityResolution,
@@ -17,6 +18,8 @@ from .query import QuoteView, SourceCandidate
 __all__ = [
     "Dataset",
     "Adjudication",
+    "AdoptionDecision",
+    "withdraw_decision",
     "PriorityRule",
     "Security",
     "CorporateAction",
