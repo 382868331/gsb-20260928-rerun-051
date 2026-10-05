@@ -31,7 +31,8 @@ class CorporateActionTests(unittest.TestCase):
             self.holdings, D(2024, 2, 1), T(2024, 2, 1, 10))
         self.assertEqual(result["positions"], (
             {"security_id": "old", "quantity": 6.0, "cost": 100.0,
-             "lot_ids": ["lot-a:a1"]},
+             "lot_ids": ["lot-a:a1"], "available_quantity": 6.0,
+             "reserved_quantity": 0.0},
         ))
         adjustment = result["adjustments"][0]
         self.assertEqual(adjustment["source_security_id"], "old")
@@ -106,12 +107,47 @@ class CorporateActionTests(unittest.TestCase):
             self.holdings, D(2024, 2, 1), T(2024, 2, 1, 10))
         self.assertEqual(result["positions"], (
             {"security_id": "old", "quantity": 3.0, "cost": 100.0,
-             "lot_ids": ["lot-a"]},
+             "lot_ids": ["lot-a"], "available_quantity": 0.0,
+             "reserved_quantity": 3.0},
         ))
         pending = result["undetermined"][0]
         self.assertEqual(pending["quantity"], 3.0)
         self.assertEqual(pending["candidate_security_ids"],
                          ("maybe-new", "other-new"))
+
+    def test_waiting_identity_reserves_shares_from_later_action_and_rejects_overuse(self):
+        self.ds.add_corporate_action(action(
+            action_id="waiting", action_type="exchange", to_security_id="",
+            confirmation_status="candidate",
+            candidate_security_ids=("maybe-new",)))
+        self.ds.add_corporate_action(action(
+            action_id="later", family_id="f2", action_type="exchange",
+            to_security_id="other-new",
+            effective_date=D(2024, 3, 1), received_at=T(2024, 3, 1, 9),
+            announcement_kind="revision"))
+        with self.assertRaisesRegex(ValueError, "超额采用"):
+            self.ds.apply_corporate_actions(
+                self.holdings, D(2024, 3, 1), T(2024, 3, 1, 10),
+                selected_quantities={
+                    "waiting": {"lot-a": 2.0},
+                    "later": {"lot-a": 2.0},
+                })
+        result = self.ds.apply_corporate_actions(
+            self.holdings, D(2024, 3, 1), T(2024, 3, 1, 10),
+            selected_quantities={
+                "waiting": {"lot-a": 2.0},
+                "later": {"lot-a": 1.0},
+            })
+        positions = {p["security_id"]: p for p in result["positions"]}
+        self.assertEqual(positions["old"]["quantity"], 2.0)
+        self.assertEqual(positions["other-new"]["quantity"], 2.0)
+        self.assertEqual(
+            result["adjustments"][0]["input_quantity"], 1.0)
+        self.assertEqual(result["undetermined"][0]["quantity"], 2.0)
+        costs = positions["old"]["cost"] + positions["other-new"]["cost"]
+        self.assertEqual(costs, 100.0)
+        self.assertAlmostEqual(result["undetermined"][0]["cost"],
+                               positions["old"]["cost"])
 
     def test_chained_partial_adoption_does_not_double_count(self):
         self.holdings.append(HoldingLot("lot-b", "old", 1.0, 40.0))
@@ -155,6 +191,45 @@ class CorporateActionTests(unittest.TestCase):
                     check["reopened"]["positions"][0]["quantity"], 6.0)
                 self.assertEqual(
                     check["adoptions"][0]["action_id"], "a1")
+
+    def test_late_revision_keeps_saved_partial_cash_and_cost_conservation(self):
+        ds = self.ds
+        ds.add_corporate_action(action(
+            action_id="exchange-1", action_type="exchange",
+            to_security_id="new", from_ratio=2, to_ratio=1,
+            cash_per_from_share=1.0, cash_cost_portion=0.25,
+            fractional_destination="cash", fractional_cash_rate=7.0))
+        ds.save_corporate_action_research(
+            "cash-research", self.holdings, D(2024, 2, 1),
+            T(2024, 2, 1, 10), T(2024, 2, 1, 11))
+        ds.add_corporate_action(action(
+            action_id="exchange-revised", action_type="exchange",
+            to_security_id="new", from_ratio=1, to_ratio=3,
+            cash_per_from_share=1.0, cash_cost_portion=0.25,
+            fractional_destination="cash", fractional_cash_rate=7.0,
+            received_at=T(2024, 2, 2, 9),
+            announcement_kind="revision"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "research.db")
+            ds.save_as(path)
+            ds.close()
+            with Dataset.open(path) as reopened:
+                check = reopened.reopen_corporate_action_research("cash-research")
+                result = check["reopened"]
+                self.assertTrue(check["same_positions"])
+                self.assertTrue(check["same_adjustments"])
+                self.assertTrue(check["same_cash_total"])
+                self.assertEqual(result["positions"], (
+                    {"security_id": "new", "quantity": 1.0, "cost": 50.0,
+                     "lot_ids": ["lot-a:exchange-1"],
+                     "available_quantity": 1.0,
+                     "reserved_quantity": 0.0},
+                ))
+                self.assertEqual(result["cash_total"], 6.5)
+                self.assertAlmostEqual(
+                    result["positions"][0]["cost"]
+                    + result["cash_compensations"][0]["allocated_cost"],
+                    100.0)
 
 
 if __name__ == "__main__":

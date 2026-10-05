@@ -780,6 +780,10 @@ class Dataset:
                 "origin_lot_id": lot["lot_id"],
                 "created_by_action_id": "",
                 "selection_locked_family": "",
+                "reserved_quantity": 0.0,
+                "reserved_cost": 0.0,
+                "available_quantity": lot["quantity"],
+                "available_cost": lot["cost"],
             })
         adjustments: list[dict] = []
         undetermined: list[dict] = []
@@ -803,11 +807,31 @@ class Dataset:
             for lot in current:
                 if (lot.get("selection_locked_family")
                         and lot["selection_locked_family"] != action.family_id):
-                    continue
-                available = lot["remaining_quantity"]
+                    action_selection = selected_quantities.get(action.action_id)
+                    family_selection = selected_quantities.get(action.family_id)
+                    explicit_locked_selection = (
+                        isinstance(action_selection, dict)
+                        and lot["lot_id"] in action_selection
+                    ) or (
+                        isinstance(family_selection, dict)
+                        and lot["lot_id"] in family_selection
+                    )
+                    if not explicit_locked_selection:
+                        continue
+                available = round(lot["available_quantity"], 12)
+                available_cost = round(lot["available_cost"], 12)
                 requested = self._selected_quantity(
                     selected_quantities, action, lot, available)
-                chosen_qty = max(0.0, min(float(requested), available))
+                requested = float(requested)
+                explicitly_requested = (
+                    action.action_id in selected_quantities
+                    or action.family_id in selected_quantities
+                    or lot["lot_id"] in selected_quantities)
+                if explicitly_requested and requested > available + 1e-10:
+                    raise ValueError(
+                        f"公司行动 {action.action_id} 超额采用：请求 {requested}，"
+                        f"可用 {available}")
+                chosen_qty = max(0.0, min(requested, available))
                 if chosen_qty <= 0:
                     continue
                 action_selection = selected_quantities.get(action.action_id)
@@ -822,23 +846,40 @@ class Dataset:
                 if explicit_selection and chosen_qty < available:
                     lot["selection_locked_family"] = action.family_id
                 if action.confirmation_status == "candidate":
+                    reserved_cost = round(
+                        available_cost * chosen_qty / available, 12)
                     undetermined.append({
                         "lot_id": lot["lot_id"],
                         "security_id": action.from_security_id,
                         "quantity": chosen_qty,
-                        "cost": lot["remaining_cost"] * chosen_qty / available,
+                        "cost": reserved_cost,
                         "action_id": action.action_id,
                         "family_id": action.family_id,
                         "candidate_security_ids": action.candidate_security_ids,
                         "reason": "公司行动新证券身份未确认，不猜测现有证券",
                     })
+                    lot["reserved_quantity"] = round(
+                        lot["reserved_quantity"] + chosen_qty, 12)
+                    lot["reserved_cost"] = round(
+                        lot["reserved_cost"] + reserved_cost, 12)
+                    lot["available_quantity"] = round(
+                        lot["available_quantity"] - chosen_qty, 12)
+                    lot["available_cost"] = round(
+                        lot["available_cost"] - reserved_cost, 12)
                     continue
-                adjustment = self._apply_one_action(lot, action, chosen_qty, available)
+                adjustment = self._apply_one_action(
+                    lot, action, chosen_qty, available, available_cost)
                 if adjustment.get("fraction_undetermined"):
                     undetermined.append(adjustment["fraction_undetermined"])
-                lot["remaining_quantity"] = round(available - chosen_qty, 12)
+                lot["remaining_quantity"] = round(
+                    lot["remaining_quantity"] - chosen_qty, 12)
+                lot["available_quantity"] = round(
+                    lot["available_quantity"] - chosen_qty, 12)
                 lot["remaining_cost"] = round(
                     lot["remaining_cost"] - adjustment["consumed_cost"], 12
+                )
+                lot["available_cost"] = round(
+                    lot["available_cost"] - adjustment["consumed_cost"], 12
                 )
                 if adjustment["output_lot"] is not None:
                     lots.append(adjustment["output_lot"])
@@ -920,14 +961,18 @@ class Dataset:
             action_selection = selected[action.action_id]
             if isinstance(action_selection, dict):
                 return float(action_selection.get(lot["lot_id"], 0.0))
+            return float(action_selection)
         if action.family_id in selected:
             family_selection = selected[action.family_id]
             if isinstance(family_selection, dict):
                 return float(family_selection.get(lot["lot_id"], 0.0))
+            return float(family_selection)
         return float(selected.get(lot["lot_id"], available))
 
-    def _apply_one_action(self, lot, action, chosen_qty, available):
-        consumed_cost = round(lot["remaining_cost"] * chosen_qty / available, 12)
+    def _apply_one_action(self, lot, action, chosen_qty, available, available_cost=None):
+        if available_cost is None:
+            available_cost = lot["remaining_cost"]
+        consumed_cost = round(available_cost * chosen_qty / available, 12)
         gross_new = chosen_qty * action.to_ratio / action.from_ratio
         whole = int(gross_new)
         fraction = round(gross_new - whole, 12)
@@ -986,6 +1031,11 @@ class Dataset:
                 "origin_lot_id": lot["origin_lot_id"],
                 "created_by_action_id": action.action_id,
                 "selection_locked_family": "",
+                "reserved_quantity": 0.0,
+                "reserved_cost": 0.0,
+                "available_quantity": round(output_qty, 12),
+                "available_cost": round(security_cost if fraction_status != "retain"
+                                         else consumed_cost - cash_cost, 12),
             }
         cash = None
         if cash_comp > 0 or fraction_cash > 0:
@@ -1026,18 +1076,26 @@ class Dataset:
     def _corporate_action_positions(lots):
         grouped = {}
         for lot in lots:
-            qty = lot["remaining_quantity"]
+            available_quantity = lot.get("available_quantity",
+                                         lot.get("remaining_quantity", 0.0))
+            reserved_quantity = lot.get("reserved_quantity", 0.0)
+            qty = lot.get("remaining_quantity", 0.0)
             if qty <= 0:
                 continue
             item = grouped.setdefault(lot["security_id"], {
                 "security_id": lot["security_id"], "quantity": 0.0,
-                "cost": 0.0, "lot_ids": []
+                "cost": 0.0, "lot_ids": [],
+                "available_quantity": 0.0, "reserved_quantity": 0.0,
             })
             item["quantity"] += qty
             item["cost"] += lot["remaining_cost"]
             item["lot_ids"].append(lot["lot_id"])
+            item["available_quantity"] += available_quantity
+            item["reserved_quantity"] += reserved_quantity
         return tuple(dict(item, quantity=round(item["quantity"], 8),
-                          cost=round(item["cost"], 8))
+                          cost=round(item["cost"], 8),
+                          available_quantity=round(item["available_quantity"], 8),
+                          reserved_quantity=round(item["reserved_quantity"], 8))
                      for item in sorted(grouped.values(),
                                        key=lambda x: x["security_id"]))
 

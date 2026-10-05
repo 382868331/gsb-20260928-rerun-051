@@ -5,6 +5,10 @@
 """
 
 from .adjudication import Adjudication
+from .action_research import (
+    AllocationDecision, CorporateActionPortfolioResearch,
+    compare_adoption_order_consistency,
+)
 from .dataset import Dataset
 from .identity import (
     CorporateAction, HoldingLot, IdentityAnnouncement, IdentityResolution,
@@ -17,6 +21,9 @@ from .query import QuoteView, SourceCandidate
 __all__ = [
     "Dataset",
     "Adjudication",
+    "AllocationDecision",
+    "CorporateActionPortfolioResearch",
+    "compare_adoption_order_consistency",
     "PriorityRule",
     "Security",
     "CorporateAction",

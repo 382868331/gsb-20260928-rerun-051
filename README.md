@@ -11,6 +11,11 @@
 >
 > 第五轮新增：**拆股、换股合并、现金补偿的版本化公司行动账本**
 > （`tests/test_corporate_actions.py`）。
+>
+> 第六轮新增：**公司行动组合的份额级持仓约束研究**，支持同批原始份额在
+> 换股、保留旧证券、等待身份核实之间互斥分配；允许撤回未定选择并释放份额，
+> 阻断循环引用和超额采用，并比较不同采用顺序的数量、成本与现金守恒
+> （`tests/test_action_research.py`）。
 
 纯 Python 标准库 + SQLite，离线运行，不联网下载任何行情。核心解决一个问题：
 **回测站在某个历史时点，只能看到当时实际已经收到的数据；后来补齐的价格、迟到的修订、事后才公告的拆分因子都不能被提前使用。**
@@ -147,6 +152,21 @@
 - `save_corporate_action_research()` 保存研究视角、采用决策和调整结果；行动后来修订
   或撤回后，`reopen_corporate_action_research()` 仍按保存时的可见公告重放，并用
   `corporate_action_adjustments()` 逐笔追溯来源行动。
+
+## 份额级持仓约束研究
+
+- CorporateActionPortfolioResearch 以 HoldingLot 为最小账本单元：既有新证券与
+  换股所得新证券保留独立批次号、来源、成本和血缘，不会混入同一来源。
+- AllocationDecision 明确每份原始份额的去向：exchange 采用换股、retain
+  保留旧证券、wait 等待新证券身份核实；同一批次去向数量合计超额时立即拒绝。
+- 前一行动产生的新批次可由后一行动继续采用，例如 original:exchange-1:exchange-2；
+  若新证券会沿血缘回到该批次已持有证券，明确报出循环引用。
+- wait 或 pending 选择会同时预留数量和成本，后续行动只能使用剩余份额；
+  withdraw() 仅允许撤回尚未确认的选择并释放预留，已确认现金补偿仍保留为事实。
+- compare_adoption_order_consistency() 使用同一批决策按多个可行行动顺序复算，
+  比较持仓数量、逐批成本、零碎份额现金和补偿现金是否一致。
+- apply_corporate_actions() 的 Dataset 重放路径同样区分实际持仓、可再分配份额与
+  待核实预留；显式申请超过剩余份额时报错，不再静默截断。
 
 ## 快速开始
 
